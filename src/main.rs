@@ -1,16 +1,14 @@
-use chrono::Utc;
-use ethers::{
-    signers::{LocalWallet, Signer},
-    types::H160,
-};
 use std::str::FromStr;
-use tokio::sync::mpsc::unbounded_channel;
-use tracing::{error, info};
 
+use chrono::Utc;
+use clap::Parser;
+use ethers::{signers::LocalWallet, types::H160};
 use hyperliquid_rust_sdk::{
     BaseUrl, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient, ExchangeDataStatus,
     ExchangeResponseStatus, InfoClient, Message, Subscription, UserData,
 };
+use tokio::sync::mpsc::unbounded_channel;
+use tracing::{debug, error, info, trace, warn};
 
 const LEVERAGE: f64 = 3.0;
 const TP_PERCENTAGE: f64 = 0.02; // 2%
@@ -18,6 +16,23 @@ const SL_PERCENTAGE: f64 = 0.04; // 4%
 const MAX_TRADE_DURATION: i64 = 3600; // 1 hour in seconds
 const MID_CHECK_DURATION: i64 = 1800; // 30 minutes in seconds
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Use mainnet instead of testnet
+    #[arg(long, default_value_t = false)]
+    mainnet: bool,
+
+    /// Initial position size per channel
+    #[arg(long, default_value_t = 15.0)]
+    size: f64,
+
+    /// Trading pair symbol
+    #[arg(long, default_value = "HYPE")]
+    symbol: String,
+}
+
+#[derive(Debug)]
 struct Trade {
     entry_price: f64,
     position_size: f64,
@@ -26,6 +41,8 @@ struct Trade {
     entry_time: i64,
     is_long: bool,
 }
+
+#[derive(Debug)]
 /// A trading bot that maintains two simultaneous trading channels (long and short)
 pub struct DualChannelTradingBot {
     /// The trading asset/coin symbol (e.g. "HYPE")
@@ -57,10 +74,22 @@ impl DualChannelTradingBot {
         decimals: u32,
         wallet: LocalWallet,
         user_address: String,
+        network: BaseUrl,
     ) -> DualChannelTradingBot {
-        let info_client = InfoClient::new(None, Some(BaseUrl::Mainnet)).await.unwrap();
+        debug!(
+            "Initializing bot with: asset={}, size={}, network={:?}",
+            asset,
+            channel_size,
+            match network {
+                BaseUrl::Mainnet => "mainnet",
+                BaseUrl::Testnet => "testnet",
+                BaseUrl::Localhost => "localhost",
+            },
+        );
+
+        let info_client = InfoClient::new(None, Some(network.clone())).await.unwrap();
         let exchange_client =
-            ExchangeClient::new(None, wallet, Some(BaseUrl::Mainnet), None, None).await.unwrap();
+            ExchangeClient::new(None, wallet, Some(network.clone()), None, None).await.unwrap();
 
         DualChannelTradingBot {
             asset,
@@ -77,27 +106,36 @@ impl DualChannelTradingBot {
     }
 
     pub async fn start(&mut self) {
+        info!("Starting dual channel bot for {}", self.asset);
+        debug!("Initial channel size: {}", self.channel_size);
+
         let (sender, mut receiver) = unbounded_channel();
 
         // Subscribe to necessary feeds
+        debug!("Subscribing to user events for address: {}", self.user_address);
         self.info_client
             .subscribe(Subscription::UserEvents { user: self.user_address }, sender.clone())
             .await
             .unwrap();
 
+        debug!("Subscribing to market data");
         self.info_client.subscribe(Subscription::AllMids, sender.clone()).await.unwrap();
 
         // Initial trades
+        debug!("Opening initial positions");
         self.open_long_trade().await;
         self.open_short_trade().await;
 
+        info!("Bot running - monitoring trades");
         loop {
             let message = receiver.recv().await.unwrap();
             match message {
                 Message::AllMids(all_mids) => {
                     let all_mids = all_mids.data.mids;
                     if let Some(mid) = all_mids.get(&self.asset) {
-                        self.latest_mid_price = mid.parse().unwrap();
+                        let new_price: f64 = mid.parse().unwrap();
+                        debug!("Price update for {}: {}", self.asset, new_price);
+                        self.latest_mid_price = new_price;
                         self.check_trades().await;
                     }
                 }
@@ -111,15 +149,18 @@ impl DualChannelTradingBot {
                                 self.current_position -= amount;
                             }
                             info!(
-                                "Fill: {} {} {}",
+                                "Fill: {} {} {} (Total Position: {})",
                                 if fill.side.eq("B") { "bought" } else { "sold" },
                                 amount,
-                                self.asset
+                                self.asset,
+                                self.current_position
                             );
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    debug!("Received unhandled message type");
+                }
             }
         }
     }
@@ -131,6 +172,12 @@ impl DualChannelTradingBot {
         if let Some(trade) = &self.long_trade {
             let should_close = self.should_close_trade(trade, current_time).await;
             if should_close {
+                debug!(
+                    "Closing long trade - Entry: {}, Current: {}, Time Open: {}s",
+                    trade.entry_price,
+                    self.latest_mid_price,
+                    current_time - trade.entry_time
+                );
                 self.close_trade(true).await;
                 self.open_long_trade().await;
             }
@@ -140,6 +187,12 @@ impl DualChannelTradingBot {
         if let Some(trade) = &self.short_trade {
             let should_close = self.should_close_trade(trade, current_time).await;
             if should_close {
+                debug!(
+                    "Closing short trade - Entry: {}, Current: {}, Time Open: {}s",
+                    trade.entry_price,
+                    self.latest_mid_price,
+                    current_time - trade.entry_time
+                );
                 self.close_trade(false).await;
                 self.open_short_trade().await;
             }
@@ -154,10 +207,22 @@ impl DualChannelTradingBot {
             (trade.entry_price - self.latest_mid_price) / trade.entry_price
         };
 
+        debug!(
+            "{} trade status - P&L: {:.2}%, Time Open: {}s",
+            if trade.is_long { "Long" } else { "Short" },
+            current_profit * 100.0,
+            time_open
+        );
+
         // Check stop loss
         if (trade.is_long && self.latest_mid_price <= trade.stop_loss) ||
             (!trade.is_long && self.latest_mid_price >= trade.stop_loss)
         {
+            warn!(
+                "{} Stop Loss triggered at {}",
+                if trade.is_long { "Long" } else { "Short" },
+                self.latest_mid_price
+            );
             return true;
         }
 
@@ -165,16 +230,31 @@ impl DualChannelTradingBot {
         if (trade.is_long && self.latest_mid_price >= trade.take_profit) ||
             (!trade.is_long && self.latest_mid_price <= trade.take_profit)
         {
+            info!(
+                "{} Take Profit reached at {}",
+                if trade.is_long { "Long" } else { "Short" },
+                self.latest_mid_price
+            );
             return true;
         }
 
         // Check 30-minute profit
         if time_open >= MID_CHECK_DURATION && current_profit > 0.0 {
+            info!(
+                "{} Mid-check profit taking at {:.2}%",
+                if trade.is_long { "Long" } else { "Short" },
+                current_profit * 100.0
+            );
             return true;
         }
 
         // Check max duration
         if time_open >= MAX_TRADE_DURATION {
+            warn!(
+                "{} Max duration reached - Closing at {:.2}% P&L",
+                if trade.is_long { "Long" } else { "Short" },
+                current_profit * 100.0
+            );
             return true;
         }
 
@@ -186,6 +266,11 @@ impl DualChannelTradingBot {
         let position_size = self.channel_size * LEVERAGE;
         let stop_loss = entry_price * (1.0 - SL_PERCENTAGE);
         let take_profit = entry_price * (1.0 + TP_PERCENTAGE);
+
+        debug!(
+            "Opening long trade - Size: {}, Entry: {}, SL: {}, TP: {}",
+            position_size, entry_price, stop_loss, take_profit
+        );
 
         self.place_order(position_size, entry_price).await;
 
@@ -207,6 +292,11 @@ impl DualChannelTradingBot {
         let stop_loss = entry_price * (1.0 + SL_PERCENTAGE);
         let take_profit = entry_price * (1.0 - TP_PERCENTAGE);
 
+        debug!(
+            "Opening short trade - Size: {}, Entry: {}, SL: {}, TP: {}",
+            position_size, entry_price, stop_loss, take_profit
+        );
+
         self.place_order(position_size, entry_price).await;
 
         self.short_trade = Some(Trade {
@@ -225,18 +315,40 @@ impl DualChannelTradingBot {
         let trade = if is_long { self.long_trade.take() } else { self.short_trade.take() };
 
         if let Some(trade) = trade {
+            debug!(
+                "Closing {} trade - Size: {}, Entry: {}, Exit: {}",
+                if is_long { "long" } else { "short" },
+                trade.position_size,
+                trade.entry_price,
+                self.latest_mid_price
+            );
+
             self.place_order(-trade.position_size, self.latest_mid_price).await;
+            let pnl = if is_long {
+                (self.latest_mid_price - trade.entry_price) / trade.entry_price * 100.0
+            } else {
+                (trade.entry_price - self.latest_mid_price) / trade.entry_price * 100.0
+            };
+
             info!(
-                "Closed {} trade at {} (Entry: {})",
+                "Closed {} trade at {} (Entry: {}, P&L: {:.2}%)",
                 if is_long { "long" } else { "short" },
                 self.latest_mid_price,
-                trade.entry_price
+                trade.entry_price,
+                pnl
             );
         }
     }
 
     async fn place_order(&self, size: f64, price: f64) {
         let is_buy = size > 0.0;
+        debug!(
+            "Placing order - Side: {}, Size: {}, Price: {}",
+            if is_buy { "Buy" } else { "Sell" },
+            size.abs(),
+            price
+        );
+
         let order = self
             .exchange_client
             .order(
@@ -296,15 +408,29 @@ impl DualChannelTradingBot {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    let _ = tracing_subscriber::fmt::try_init();
+    // Parse command line arguments
+    let args = Args::parse();
+
+    // Initialize logging with debug level for our crate
+    let filter = format!("{}=debug", env!("CARGO_PKG_NAME").replace('-', "_"));
+    tracing_subscriber::fmt().with_env_filter(filter).with_file(true).with_line_number(true).init();
+
     let _ = dotenvy::dotenv();
 
     let private_key = std::env::var("PRIVATE_KEY")?;
     let user_address = std::env::var("USER_ADDRESS")?;
     let wallet = LocalWallet::from_str(&private_key)?;
 
+    let network = if args.mainnet { BaseUrl::Mainnet } else { BaseUrl::Testnet };
+    info!(
+        "Starting bot on {} network with {} size",
+        if args.mainnet { "mainnet" } else { "testnet" },
+        args.size
+    );
+
     let mut bot =
-        DualChannelTradingBot::new("HYPE".to_string(), 30.0, 2, wallet, user_address).await;
+        DualChannelTradingBot::new(args.symbol, args.size, 2, wallet, user_address, network).await;
+
     bot.start().await;
 
     Ok(())
