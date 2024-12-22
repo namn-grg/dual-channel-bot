@@ -121,6 +121,21 @@ impl DualChannelTradingBot {
         debug!("Subscribing to market data");
         self.info_client.subscribe(Subscription::AllMids, sender.clone()).await.unwrap();
 
+        info!("Waiting for initial price data...");
+        // Wait for first valid price
+        loop {
+            let message = receiver.recv().await.unwrap();
+            if let Message::AllMids(all_mids) = message {
+                if let Some(mid) = all_mids.data.mids.get(&self.asset) {
+                    self.latest_mid_price = mid.parse().unwrap();
+                    if self.latest_mid_price > 0.0 {
+                        info!("Received initial price: {}", self.latest_mid_price);
+                        break;
+                    }
+                }
+            }
+        }
+
         // Initial trades
         debug!("Opening initial positions");
         self.open_long_trade().await;
@@ -413,7 +428,7 @@ async fn main() -> eyre::Result<()> {
 
     // Initialize logging with debug level for our crate
     let filter = format!("{}=debug", env!("CARGO_PKG_NAME").replace('-', "_"));
-    tracing_subscriber::fmt().with_env_filter(filter).with_file(true).with_line_number(true).init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let _ = dotenvy::dotenv();
 
