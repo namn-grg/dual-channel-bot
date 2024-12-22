@@ -1,1 +1,2 @@
-# hyper-of
+# DUAL CHANNEL BOT 🔀
+

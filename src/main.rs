@@ -1,17 +1,15 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use ethers::{
     signers::{LocalWallet, Signer},
     types::H160,
 };
-use log::{error, info};
-use std::collections::VecDeque;
 use std::str::FromStr;
 use tokio::sync::mpsc::unbounded_channel;
+use tracing::{error, info};
 
 use hyperliquid_rust_sdk::{
-    bps_diff, truncate_float, BaseUrl, CandleData, ClientCancelRequest, ClientLimit, ClientOrder,
-    ClientOrderRequest, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
-    Message, Subscription, UserData,
+    BaseUrl, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient, ExchangeDataStatus,
+    ExchangeResponseStatus, InfoClient, Message, Subscription, UserData,
 };
 
 const LEVERAGE: f64 = 3.0;
@@ -28,17 +26,27 @@ struct Trade {
     entry_time: i64,
     is_long: bool,
 }
-
+/// A trading bot that maintains two simultaneous trading channels (long and short)
 pub struct DualChannelTradingBot {
+    /// The trading asset/coin symbol (e.g. "HYPE")
     asset: String,
-    channel_size: f64, // size per channel (long/short)
+    /// The position size to use for each channel (long/short)
+    channel_size: f64,
+    /// Number of decimal places for price/size rounding
     decimals: u32,
+    /// Current total position size across both channels
     current_position: f64,
+    /// Latest mid price from the orderbook
     latest_mid_price: f64,
+    /// Client for market data and subscriptions
     info_client: InfoClient,
+    /// Client for executing trades
     exchange_client: ExchangeClient,
+    /// Ethereum address of the trading wallet
     user_address: H160,
+    /// Details of the current long trade if one exists
     long_trade: Option<Trade>,
+    /// Details of the current short trade if one exists
     short_trade: Option<Trade>,
 }
 
@@ -48,13 +56,11 @@ impl DualChannelTradingBot {
         channel_size: f64,
         decimals: u32,
         wallet: LocalWallet,
+        user_address: String,
     ) -> DualChannelTradingBot {
-        let user_address = wallet.address();
-
-        let info_client = InfoClient::new(None, Some(BaseUrl::Testnet)).await.unwrap();
-        let exchange_client = ExchangeClient::new(None, wallet, Some(BaseUrl::Testnet), None, None)
-            .await
-            .unwrap();
+        let info_client = InfoClient::new(None, Some(BaseUrl::Mainnet)).await.unwrap();
+        let exchange_client =
+            ExchangeClient::new(None, wallet, Some(BaseUrl::Mainnet), None, None).await.unwrap();
 
         DualChannelTradingBot {
             asset,
@@ -64,7 +70,7 @@ impl DualChannelTradingBot {
             latest_mid_price: -1.0,
             info_client,
             exchange_client,
-            user_address,
+            user_address: H160::from_str(&user_address).unwrap(),
             long_trade: None,
             short_trade: None,
         }
@@ -75,19 +81,11 @@ impl DualChannelTradingBot {
 
         // Subscribe to necessary feeds
         self.info_client
-            .subscribe(
-                Subscription::UserEvents {
-                    user: self.user_address,
-                },
-                sender.clone(),
-            )
+            .subscribe(Subscription::UserEvents { user: self.user_address }, sender.clone())
             .await
             .unwrap();
 
-        self.info_client
-            .subscribe(Subscription::AllMids, sender.clone())
-            .await
-            .unwrap();
+        self.info_client.subscribe(Subscription::AllMids, sender.clone()).await.unwrap();
 
         // Initial trades
         self.open_long_trade().await;
@@ -157,15 +155,15 @@ impl DualChannelTradingBot {
         };
 
         // Check stop loss
-        if (trade.is_long && self.latest_mid_price <= trade.stop_loss)
-            || (!trade.is_long && self.latest_mid_price >= trade.stop_loss)
+        if (trade.is_long && self.latest_mid_price <= trade.stop_loss) ||
+            (!trade.is_long && self.latest_mid_price >= trade.stop_loss)
         {
             return true;
         }
 
         // Check take profit
-        if (trade.is_long && self.latest_mid_price >= trade.take_profit)
-            || (!trade.is_long && self.latest_mid_price <= trade.take_profit)
+        if (trade.is_long && self.latest_mid_price >= trade.take_profit) ||
+            (!trade.is_long && self.latest_mid_price <= trade.take_profit)
         {
             return true;
         }
@@ -200,10 +198,7 @@ impl DualChannelTradingBot {
             is_long: true,
         });
 
-        info!(
-            "Opened long trade at {} with size {}",
-            entry_price, position_size
-        );
+        info!("Opened long trade at {} with size {}", entry_price, position_size);
     }
 
     async fn open_short_trade(&mut self) {
@@ -223,22 +218,14 @@ impl DualChannelTradingBot {
             is_long: false,
         });
 
-        info!(
-            "Opened short trade at {} with size {}",
-            entry_price, position_size
-        );
+        info!("Opened short trade at {} with size {}", entry_price, position_size);
     }
 
     async fn close_trade(&mut self, is_long: bool) {
-        let trade = if is_long {
-            self.long_trade.take()
-        } else {
-            self.short_trade.take()
-        };
+        let trade = if is_long { self.long_trade.take() } else { self.short_trade.take() };
 
         if let Some(trade) = trade {
-            self.place_order(-trade.position_size, self.latest_mid_price)
-                .await;
+            self.place_order(-trade.position_size, self.latest_mid_price).await;
             info!(
                 "Closed {} trade at {} (Entry: {})",
                 if is_long { "long" } else { "short" },
@@ -260,9 +247,7 @@ impl DualChannelTradingBot {
                     limit_px: price,
                     sz: size.abs(),
                     cloid: None,
-                    order_type: ClientOrder::Limit(ClientLimit {
-                        tif: "Gtc".to_string(),
-                    }),
+                    order_type: ClientOrder::Limit(ClientLimit { tif: "Gtc".to_string() }),
                 },
                 None,
             )
@@ -310,12 +295,16 @@ impl DualChannelTradingBot {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    dotenv::dotenv()?;
+async fn main() -> eyre::Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
     let private_key = std::env::var("PRIVATE_KEY")?;
+    let user_address = std::env::var("USER_ADDRESS")?;
     let wallet = LocalWallet::from_str(&private_key)?;
 
-    let mut bot = DualChannelTradingBot::new("HYPE".to_string(), 100.0, 2, wallet).await;
+    let mut bot =
+        DualChannelTradingBot::new("HYPE".to_string(), 30.0, 2, wallet, user_address).await;
     bot.start().await;
 
     Ok(())
