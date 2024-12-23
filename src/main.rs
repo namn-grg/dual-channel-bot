@@ -7,12 +7,12 @@ use hyperliquid_rust_sdk::{
     BaseUrl, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient, ExchangeDataStatus,
     ExchangeResponseStatus, InfoClient, Message, Subscription, UserData,
 };
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::{signal, sync::mpsc::unbounded_channel};
 use tracing::{debug, error, info, warn};
 
-const LEVERAGE: u32 = 3;
-const TP_PERCENTAGE: f64 = 0.02; // 2%
-const SL_PERCENTAGE: f64 = 0.04; // 4%
+const LEVERAGE: f64 = 3.0;
+const TP_PERCENTAGE: f64 = 0.02 / LEVERAGE; // 2%
+const SL_PERCENTAGE: f64 = 0.04 / LEVERAGE; // 4%
 const MAX_TRADE_DURATION: i64 = 3600; // 1 hour in seconds
 const MID_CHECK_DURATION: i64 = 1800; // 30 minutes in seconds
 
@@ -87,11 +87,6 @@ impl DualChannelTradingBot {
         let info_client = InfoClient::new(None, Some(network.clone())).await.unwrap();
         let exchange_client =
             ExchangeClient::new(None, wallet, Some(network.clone()), None, None).await.unwrap();
-        // let response = exchange_client
-        //     .update_leverage(LEVERAGE, &asset, false, None)
-        //     .await
-        //     .unwrap();
-        // info!("Update leverage response: {response:?}");
 
         DualChannelTradingBot {
             asset,
@@ -159,16 +154,29 @@ impl DualChannelTradingBot {
                     if let UserData::Fills(fills) = user_events.data {
                         for fill in fills {
                             let amount: f64 = fill.sz.parse().unwrap();
-                            if fill.side.eq("B") {
+                            let price: f64 = fill.px.parse().unwrap();
+                            let is_buy = fill.side.eq("B");
+
+                            if is_buy {
                                 self.current_position += amount;
+                                // Set TP/SL for long position
+                                let tp_price = self.round_price(price * (1.0 + TP_PERCENTAGE));
+                                let sl_price = self.round_price(price * (1.0 - SL_PERCENTAGE));
+                                self.place_tp_sl_orders(amount, true, tp_price, sl_price).await;
                             } else {
                                 self.current_position -= amount;
+                                // Set TP/SL for short position
+                                let tp_price = self.round_price(price * (1.0 - TP_PERCENTAGE));
+                                let sl_price = self.round_price(price * (1.0 + SL_PERCENTAGE));
+                                self.place_tp_sl_orders(amount, false, tp_price, sl_price).await;
                             }
+
                             info!(
-                                "Fill: {} {} {} (Total Position: {})",
-                                if fill.side.eq("B") { "bought" } else { "sold" },
+                                "Fill: {} {} {} at {} (Total Position: {})",
+                                if is_buy { "bought" } else { "sold" },
                                 amount,
                                 self.asset,
+                                price,
                                 self.current_position
                             );
                         }
@@ -288,7 +296,7 @@ impl DualChannelTradingBot {
             position_size, entry_price, stop_loss, take_profit
         );
 
-        self.place_order(position_size, entry_price, take_profit, stop_loss).await;
+        self.place_order(position_size, entry_price).await;
 
         self.long_trade = Some(Trade {
             entry_price,
@@ -313,7 +321,7 @@ impl DualChannelTradingBot {
             position_size, entry_price, stop_loss, take_profit
         );
 
-        self.place_order(position_size, entry_price, take_profit, stop_loss).await;
+        self.place_order(position_size, entry_price).await;
 
         self.short_trade = Some(Trade {
             entry_price,
@@ -340,7 +348,7 @@ impl DualChannelTradingBot {
                 exit_price
             );
 
-            self.place_order(-trade.position_size, exit_price, 0.0, 0.0).await;
+            self.place_order(-trade.position_size, exit_price).await;
 
             let pnl = if is_long {
                 (exit_price - trade.entry_price) / trade.entry_price * 100.0
@@ -358,7 +366,49 @@ impl DualChannelTradingBot {
         }
     }
 
-    async fn place_order(&self, size: f64, price: f64, tp_price: f64, sl_price: f64) {
+    async fn place_tp_sl_orders(&self, size: f64, is_buy: bool, tp_price: f64, sl_price: f64) {
+        if tp_price == 0.0 || sl_price == 0.0 {
+            return;
+        }
+
+        // Place Take Profit order
+        let tp_order = self
+            .exchange_client
+            .order(
+                ClientOrderRequest {
+                    asset: self.asset.clone(),
+                    is_buy: !is_buy, // Opposite side of the main order
+                    reduce_only: true,
+                    limit_px: tp_price,
+                    sz: size.abs(),
+                    cloid: None,
+                    order_type: ClientOrder::Limit(ClientLimit { tif: "Gtc".to_string() }),
+                },
+                None,
+            )
+            .await;
+        debug!("Take Profit order response: {:?}", tp_order);
+
+        // Place Stop Loss order
+        let sl_order = self
+            .exchange_client
+            .order(
+                ClientOrderRequest {
+                    asset: self.asset.clone(),
+                    is_buy: !is_buy, // Opposite side of the main order
+                    reduce_only: true,
+                    limit_px: sl_price,
+                    sz: size.abs(),
+                    cloid: None,
+                    order_type: ClientOrder::Limit(ClientLimit { tif: "Gtc".to_string() }),
+                },
+                None,
+            )
+            .await;
+        debug!("Stop Loss order response: {:?}", sl_order);
+    }
+
+    async fn place_order(&self, size: f64, price: f64) {
         let is_buy = size > 0.0;
 
         debug!(
@@ -376,7 +426,7 @@ impl DualChannelTradingBot {
                     is_buy,
                     reduce_only: false,
                     limit_px: price,
-                    sz: size,
+                    sz: size.abs(),
                     cloid: None,
                     order_type: ClientOrder::Limit(ClientLimit { tif: "Gtc".to_string() }),
                 },
@@ -395,60 +445,16 @@ impl DualChannelTradingBot {
                                 info!(
                                     "Order filled: {} {} {} at {}",
                                     if is_buy { "Bought" } else { "Sold" },
-                                    size,
+                                    size.abs(),
                                     self.asset,
                                     price
                                 );
-
-                                if tp_price == 0.0 || sl_price == 0.0 {
-                                    return;
-                                }
-
-                                // Place Take Profit order
-                                let tp_order = self
-                                    .exchange_client
-                                    .order(
-                                        ClientOrderRequest {
-                                            asset: self.asset.clone(),
-                                            is_buy: !is_buy, // Opposite side of the main order
-                                            reduce_only: true,
-                                            limit_px: tp_price,
-                                            sz: size,
-                                            cloid: None,
-                                            order_type: ClientOrder::Limit(ClientLimit {
-                                                tif: "Gtc".to_string(),
-                                            }),
-                                        },
-                                        None,
-                                    )
-                                    .await;
-                                debug!("Take Profit order response: {:?}", tp_order);
-
-                                // Place Stop Loss order
-                                let sl_order = self
-                                    .exchange_client
-                                    .order(
-                                        ClientOrderRequest {
-                                            asset: self.asset.clone(),
-                                            is_buy: !is_buy, // Opposite side of the main order
-                                            reduce_only: true,
-                                            limit_px: sl_price,
-                                            sz: size,
-                                            cloid: None,
-                                            order_type: ClientOrder::Limit(ClientLimit {
-                                                tif: "Gtc".to_string(),
-                                            }),
-                                        },
-                                        None,
-                                    )
-                                    .await;
-                                debug!("Stop Loss order response: {:?}", sl_order);
                             }
                             ExchangeDataStatus::Resting(_) => {
                                 info!(
                                     "Order resting: {} {} {} at {}",
                                     if is_buy { "Buy" } else { "Sell" },
-                                    size,
+                                    size.abs(),
                                     self.asset,
                                     price
                                 );
@@ -460,7 +466,6 @@ impl DualChannelTradingBot {
                         }
                     }
                 }
-                debug!("Main order placed successfully.");
             }
             Ok(ExchangeResponseStatus::Err(e)) => {
                 error!("Error placing main order: {}", e);
@@ -480,10 +485,34 @@ impl DualChannelTradingBot {
     /// Helper function to round size to sz_decimals
     fn round_size(&self, size: f64, price: f64) -> f64 {
         let sz_decimals = 2; // Define sz_decimals here
-        let leverage = LEVERAGE as f64;
-        ((size.abs() / price * leverage) * 10f64.powi(sz_decimals as i32)).round() /
+        ((size.abs() / price * LEVERAGE) * 10f64.powi(sz_decimals as i32)).round() /
             10f64.powi(sz_decimals as i32)
     }
+}
+
+/// Gracefully shuts down the bot, closes all open positions, and prints statistics
+async fn shutdown_bot(bot: &mut DualChannelTradingBot) {
+    info!("Shutting down the bot...");
+
+    // // Close any open long trade
+    // if bot.long_trade.is_some() {
+    //     info!("Closing open long position...");
+    //     bot.close_trade(true).await;
+    // }
+
+    // // Close any open short trade
+    // if bot.short_trade.is_some() {
+    //     info!("Closing open short position...");
+    //     bot.close_trade(false).await;
+    // }
+
+    // Print bot statistics
+    let total_trades = bot.long_trade.is_some() as u64 + bot.short_trade.is_some() as u64;
+    info!("Bot shutdown completed.");
+    info!(
+        "Exiting with stats: Total Trades Executed: {}, Final Position: {}",
+        total_trades, bot.current_position
+    );
 }
 
 #[tokio::main]
@@ -511,7 +540,17 @@ async fn main() -> eyre::Result<()> {
     let mut bot =
         DualChannelTradingBot::new(args.symbol, args.size, wallet, user_address, network).await;
 
-    bot.start().await;
+    // Spawn the bot and listen for shutdown signals
+    tokio::select! {
+        _ = bot.start() => {
+            // If bot.start exits, we clean up
+            info!("Bot stopped running.");
+        }
+        _ = signal::ctrl_c() => {
+            info!("Received shutdown signal (Ctrl+C).");
+            shutdown_bot(&mut bot).await;
+        }
+    }
 
     Ok(())
 }
