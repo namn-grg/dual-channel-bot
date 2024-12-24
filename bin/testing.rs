@@ -316,17 +316,46 @@ impl TestTradingFramework {
     /// Utility method to print a summary of all closed trades and total PnL.
     pub fn print_summary(&self) {
         info!("--------------- Trade Summary ---------------");
+
+        // Counters for profitable and non-profitable trades
+        let mut profitable_trades = 0;
+        let mut loss_trades = 0;
+
         for (i, trade) in self.closed_trades.iter().enumerate() {
+            // Calculate PnL for each trade
+            let trade_pnl = if let Some(close_price) = trade.close_price {
+                match trade.direction {
+                    Direction::Long => (close_price - trade.open_price) * trade.notional / trade.open_price,
+                    Direction::Short => (trade.open_price - close_price) * trade.notional / trade.open_price,
+                }
+            } else {
+                0.0 // Should not occur for closed trades
+            };
+
+            // Increment counters based on PnL
+            if trade_pnl > 0.0 {
+                profitable_trades += 1;
+            } else {
+                loss_trades += 1;
+            }
+
+            // Print details of each trade
             info!(
-                "#{:<2} {:?} Open={:.4}, Close={:.4?}, Notional={:.2}",
+                "#{:<2} {:?} Open={:.4}, Close={:.4?}, Notional={:.2}, PnL=${:.4}",
                 i + 1,
                 trade.direction,
                 trade.open_price,
                 trade.close_price.unwrap_or_default(),
-                trade.notional
+                trade.notional,
+                trade_pnl
             );
         }
-        info!("Total PnL so far = ${:.4}", self.total_pnl_usd);
+
+        // Print the summary
+        info!(
+            "[STATS] Total PnL = ${:.4}, Total Profitable Trades = {}, Total Loss Trades = {}",
+            self.total_pnl_usd, profitable_trades, loss_trades
+        );
     }
 }
 
@@ -401,7 +430,7 @@ async fn main() -> eyre::Result<()> {
                         }
                     },
                     _ = interval.tick() => {
-                        info!("Current PnL = ${:.2}", framework.total_pnl_usd);
+                        framework.print_summary();
                     },
                     _ = signal::ctrl_c() => {
                         warn!("Ctrl+C received. Shutting down.");
