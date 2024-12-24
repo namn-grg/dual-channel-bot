@@ -6,7 +6,7 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Write},
 };
 
-/// A single price tick (price + timestamp). 
+/// A single price tick (price + timestamp).
 /// If you want to store more info (like best bid/ask, volume, etc.),
 /// extend this struct with additional fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,16 +18,10 @@ pub struct PriceTick {
 /// Store a tick to the cache efficiently
 pub fn store_tick_to_cache(path: &str, price: f64) -> eyre::Result<()> {
     // Create a new PriceTick
-    let tick = PriceTick {
-        timestamp: Utc::now().timestamp(),
-        price,
-    };
+    let tick = PriceTick { timestamp: Utc::now().timestamp(), price };
 
     // Open the file in append mode and write the tick as a compact JSON object
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
     let mut writer = BufWriter::new(file);
 
     // Write the tick as a compact JSON object, followed by a newline

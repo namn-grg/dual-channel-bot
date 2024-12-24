@@ -16,7 +16,7 @@ enum RunMode {
     Cached,
 }
 
-const PRINT_STATS_INTERVAL: u64 = 300; // 5 minutes in seconds
+const PRINT_STATS_INTERVAL: u64 = 60; // in seconds
 const CACHE_DIR: &str = ".cache";
 
 /// Our CLI arguments
@@ -44,7 +44,6 @@ struct Args {
     #[arg(long, default_value_t = 0.000432)] // 0.0432%
     fees: f64,
     // In real usage, you'd have `--mainnet` or other arguments from your main code
-
     /// Name of the asset to trade (eg: HYPE)
     #[arg(long, default_value = "HYPE")]
     asset: String,
@@ -325,8 +324,12 @@ impl TestTradingFramework {
             // Calculate PnL for each trade
             let trade_pnl = if let Some(close_price) = trade.close_price {
                 match trade.direction {
-                    Direction::Long => (close_price - trade.open_price) * trade.notional / trade.open_price,
-                    Direction::Short => (trade.open_price - close_price) * trade.notional / trade.open_price,
+                    Direction::Long => {
+                        (close_price - trade.open_price) * trade.notional / trade.open_price
+                    }
+                    Direction::Short => {
+                        (trade.open_price - close_price) * trade.notional / trade.open_price
+                    }
                 }
             } else {
                 0.0 // Should not occur for closed trades
