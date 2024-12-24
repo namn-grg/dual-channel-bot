@@ -77,12 +77,12 @@ enum Direction {
 #[derive(Debug, Clone)]
 struct Trade {
     direction: Direction,
-    open_price: f64,
-    open_time: i64, // store as UTC timestamp
-    close_price: Option<f64>,
+    entry_price: f64,
+    entry_time: i64, // store as UTC timestamp
     notional: f64,
     tp_price: f64,
     sl_price: f64,
+    close_price: Option<f64>,
 }
 
 /// Our test-simulation framework
@@ -118,8 +118,8 @@ impl TestTradingFramework {
 
         self.long_trade = Some(Trade {
             direction: Direction::Long,
-            open_price: price,
-            open_time: current_ts,
+            entry_price: price,
+            entry_time: current_ts,
             close_price: None,
             notional,
             tp_price: long_tp,
@@ -128,8 +128,8 @@ impl TestTradingFramework {
 
         self.short_trade = Some(Trade {
             direction: Direction::Short,
-            open_price: price,
-            open_time: current_ts,
+            entry_price: price,
+            entry_time: current_ts,
             close_price: None,
             notional,
             tp_price: short_tp,
@@ -180,7 +180,7 @@ impl TestTradingFramework {
         current_price: f64,
         current_ts: i64,
     ) -> Option<String> {
-        let elapsed = (current_ts - trade.open_time) as u64;
+        let elapsed = (current_ts - trade.entry_time) as u64;
 
         // First check timeout as it's independent of price
         if elapsed >= self.params.timeout_sec {
@@ -220,8 +220,12 @@ impl TestTradingFramework {
 
         // Calculate PnL, fees, etc.
         let pnl = match trade.direction {
-            Direction::Long => (exit_price - trade.open_price) / trade.open_price * trade.notional,
-            Direction::Short => (trade.open_price - exit_price) / trade.open_price * trade.notional,
+            Direction::Long => {
+                (exit_price - trade.entry_price) / trade.entry_price * trade.notional
+            }
+            Direction::Short => {
+                (trade.entry_price - exit_price) / trade.entry_price * trade.notional
+            }
         };
 
         let fee_cost = trade.notional * self.params.fees * 2.0;
@@ -229,15 +233,12 @@ impl TestTradingFramework {
         self.total_pnl_usd += net_pnl;
 
         // Create closed trade record
-        let closed_trade = Trade {
-            close_price: Some(exit_price),
-            ..trade
-        };
+        let closed_trade = Trade { close_price: Some(exit_price), ..trade };
         self.closed_trades.push(closed_trade);
 
         info!(
             "Closed {direction_str}: Entry={:.4}, Exit={:.4}, PnL=${:.4} ({:.2}%), Fees=${:.4}",
-            trade.open_price,
+            trade.entry_price,
             exit_price,
             net_pnl,
             (pnl / trade.notional) * 100.0,
@@ -261,8 +262,8 @@ impl TestTradingFramework {
 
         let new_trade = Trade {
             direction,
-            open_price: price,
-            open_time: current_ts,
+            entry_price: price,
+            entry_time: current_ts,
             close_price: None,
             notional,
             tp_price,
@@ -289,19 +290,19 @@ impl TestTradingFramework {
     /// Prints the *unrealized* PnL for any open trades at the current `price`.
     fn print_current_pnl(&self, price: f64) {
         if let Some(t) = &self.long_trade {
-            let pct = (price - t.open_price) / t.open_price * 100.0;
+            let pct = (price - t.entry_price) / t.entry_price * 100.0;
             let pnl = pct * t.notional / 100.0;
             debug!(
                 "LONG: Entry={:.4}, Current={:.4}, PnL=${:.2} ({:.2}%)",
-                t.open_price, price, pnl, pct
+                t.entry_price, price, pnl, pct
             );
         }
         if let Some(t) = &self.short_trade {
-            let pct = (t.open_price - price) / t.open_price * 100.0;
+            let pct = (t.entry_price - price) / t.entry_price * 100.0;
             let pnl = pct * t.notional / 100.0;
             debug!(
                 "SHORT: Entry={:.4}, Current={:.4}, PnL=${:.2} ({:.2}%)",
-                t.open_price, price, pnl, pct
+                t.entry_price, price, pnl, pct
             );
         }
     }
@@ -319,10 +320,10 @@ impl TestTradingFramework {
             let trade_pnl = if let Some(close_price) = trade.close_price {
                 match trade.direction {
                     Direction::Long => {
-                        (close_price - trade.open_price) * trade.notional / trade.open_price
+                        (close_price - trade.entry_price) * trade.notional / trade.entry_price
                     }
                     Direction::Short => {
-                        (trade.open_price - close_price) * trade.notional / trade.open_price
+                        (trade.entry_price - close_price) * trade.notional / trade.entry_price
                     }
                 }
             } else {
@@ -341,7 +342,7 @@ impl TestTradingFramework {
                 "#{:<2} {:?} Open={:.4}, Close={:.4?}, Notional={:.2}, PnL=${:.4}",
                 i + 1,
                 trade.direction,
-                trade.open_price,
+                trade.entry_price,
                 trade.close_price.unwrap_or_default(),
                 trade.notional,
                 trade_pnl
