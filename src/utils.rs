@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use ethers::{signers::LocalWallet, types::H160};
 use hyperliquid_rust_sdk::{
@@ -15,7 +15,6 @@ use hyperliquid_rust_sdk::{
 };
 
 /// A small delay before re-opening a position after closing one
-/// (Can be changed or moved to your main code.)
 pub const SLEEP_BEFORE_OPENING_POSITION: u64 = 3;
 
 // ----------------------------------------
@@ -150,6 +149,7 @@ impl TradingAccount {
                 None,
             )
             .await?;
+        debug!("Order response: {:?}", order);
 
         match order {
             ExchangeResponseStatus::Ok(response) => {
@@ -213,6 +213,7 @@ pub async fn close_position(
                 None,
             )
             .await?;
+        debug!("Close Order response: {:?}", order);
 
         match order {
             ExchangeResponseStatus::Ok(_) => {

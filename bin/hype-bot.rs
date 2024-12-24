@@ -82,8 +82,8 @@ impl DualAccountBot {
         params: SimParams,
         long_wallet: LocalWallet,
         short_wallet: LocalWallet,
-        long_address: String,
-        short_address: String,
+        user_address_long: String,
+        user_address_short: String,
         network: BaseUrl,
     ) -> eyre::Result<Self> {
         let info_client = InfoClient::new(None, Some(network.clone())).await?;
@@ -97,7 +97,7 @@ impl DualAccountBot {
         let long_account = TradingAccount {
             wallet: long_wallet,
             exchange_client: long_exchange,
-            user_address: H160::from_str(&long_address)?,
+            user_address: H160::from_str(&user_address_long)?,
             active_trade: None,
             is_long_account: true,
         };
@@ -105,7 +105,7 @@ impl DualAccountBot {
         let short_account = TradingAccount {
             wallet: short_wallet,
             exchange_client: short_exchange,
-            user_address: H160::from_str(&short_address)?,
+            user_address: H160::from_str(&user_address_short)?,
             active_trade: None,
             is_long_account: false,
         };
@@ -307,13 +307,13 @@ async fn main() -> eyre::Result<()> {
     dotenv()?;
 
     // Load credentials for both accounts
-    let long_key = std::env::var("LONG_PRIVATE_KEY")?;
-    let short_key = std::env::var("SHORT_PRIVATE_KEY")?;
-    let long_address = std::env::var("LONG_ADDRESS")?;
-    let short_address = std::env::var("SHORT_ADDRESS")?;
+    let private_key_long = std::env::var("PRIVATE_KEY_LONG")?;
+    let private_key_short = std::env::var("PRIVATE_KEY_SHORT")?;
+    let user_address_long = std::env::var("USER_ADDRESS_LONG")?;
+    let user_address_short = std::env::var("USER_ADDRESS_SHORT")?;
 
-    let long_wallet = LocalWallet::from_str(&long_key)?;
-    let short_wallet = LocalWallet::from_str(&short_key)?;
+    let long_wallet = LocalWallet::from_str(&private_key_long)?;
+    let short_wallet = LocalWallet::from_str(&private_key_short)?;
 
     // Decide the network
     let network = if args.mainnet { BaseUrl::Mainnet } else { BaseUrl::Testnet };
@@ -339,8 +339,8 @@ async fn main() -> eyre::Result<()> {
         params,
         long_wallet,
         short_wallet,
-        long_address,
-        short_address,
+        user_address_long,
+        user_address_short,
         network,
     )
     .await?;
