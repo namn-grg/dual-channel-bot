@@ -80,7 +80,6 @@ struct Trade {
     open_price: f64,
     open_time: i64, // store as UTC timestamp
     close_price: Option<f64>,
-    close_time: Option<i64>,
     notional: f64,
     tp_price: f64,
     sl_price: f64,
@@ -122,7 +121,6 @@ impl TestTradingFramework {
             open_price: price,
             open_time: current_ts,
             close_price: None,
-            close_time: None,
             notional,
             tp_price: long_tp,
             sl_price: long_sl,
@@ -133,7 +131,6 @@ impl TestTradingFramework {
             open_price: price,
             open_time: current_ts,
             close_price: None,
-            close_time: None,
             notional,
             tp_price: short_tp,
             sl_price: short_sl,
@@ -234,7 +231,6 @@ impl TestTradingFramework {
         // Create closed trade record
         let closed_trade = Trade {
             close_price: Some(exit_price),
-            close_time: Some(Utc::now().timestamp()),
             ..trade
         };
         self.closed_trades.push(closed_trade);
@@ -268,7 +264,6 @@ impl TestTradingFramework {
             open_price: price,
             open_time: current_ts,
             close_price: None,
-            close_time: None,
             notional,
             tp_price,
             sl_price,
