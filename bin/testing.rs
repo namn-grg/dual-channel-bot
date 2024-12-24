@@ -109,7 +109,7 @@ impl TestTradingFramework {
 
     /// Open both trades (long & short) initially at the same price.
     pub fn open_initial_trades(&mut self, price: f64) {
-        let now_ts = Utc::now().timestamp();
+        let current_ts = Utc::now().timestamp();
         let notional = self.params.amount * self.params.leverage;
 
         let long_tp = price * (1.0 + self.params.tp_percent);
@@ -120,7 +120,7 @@ impl TestTradingFramework {
         self.long_trade = Some(Trade {
             direction: Direction::Long,
             open_price: price,
-            open_time: now_ts,
+            open_time: current_ts,
             close_price: None,
             close_time: None,
             notional,
@@ -131,7 +131,7 @@ impl TestTradingFramework {
         self.short_trade = Some(Trade {
             direction: Direction::Short,
             open_price: price,
-            open_time: now_ts,
+            open_time: current_ts,
             close_price: None,
             close_time: None,
             notional,
@@ -150,27 +150,27 @@ impl TestTradingFramework {
     ///  - Close trades if conditions are met
     ///  - Re-open them immediately (so there is always one long and one short open)
     pub fn on_price_update(&mut self, price: f64) {
-        let now_ts = Utc::now().timestamp();
+        let current_ts = Utc::now().timestamp();
 
         // Print current PnL for each trade
         self.print_current_pnl(price);
 
         // Check and process long trade
-        if let Some(reason) = self.check_should_close(&self.long_trade, price, now_ts) {
-            info!("Closing LONG => {reason}");
-            if let Some(trade) = self.long_trade.take() {
-                self.close_trade(trade, price);
+        if let Some(long_trade) = &self.long_trade {
+            if let Some(reason) = self.check_should_close(long_trade, price, current_ts) {
+                info!("Closing LONG => {reason}");
+                self.close_trade(long_trade.clone(), price);
+                self.open_new_trade(Direction::Long, price);
             }
-            self.open_new_trade(Direction::Long, price);
         }
 
         // Check and process short trade
-        if let Some(reason) = self.check_should_close(&self.short_trade, price, now_ts) {
-            info!("Closing SHORT => {reason}");
-            if let Some(trade) = self.short_trade.take() {
-                self.close_trade(trade, price);
+        if let Some(short_trade) = &self.short_trade {
+            if let Some(reason) = self.check_should_close(short_trade, price, current_ts) {
+                info!("Closing SHORT => {reason}");
+                self.close_trade(short_trade.clone(), price);
+                self.open_new_trade(Direction::Short, price);
             }
-            self.open_new_trade(Direction::Short, price);
         }
     }
 
@@ -179,12 +179,11 @@ impl TestTradingFramework {
     ///  - Price hitting the trade's take-profit or stop-loss
     fn check_should_close(
         &self,
-        maybe_trade: &Option<Trade>,
+        trade: &Trade,
         current_price: f64,
-        now_ts: i64,
+        current_ts: i64,
     ) -> Option<String> {
-        let trade = maybe_trade.as_ref()?;
-        let elapsed = (now_ts - trade.open_time) as u64;
+        let elapsed = (current_ts - trade.open_time) as u64;
 
         // First check timeout as it's independent of price
         if elapsed >= self.params.timeout_sec {
@@ -252,7 +251,7 @@ impl TestTradingFramework {
 
     /// Re-open a new trade in the specified `direction` immediately.
     fn open_new_trade(&mut self, direction: Direction, price: f64) {
-        let now_ts = Utc::now().timestamp();
+        let current_ts = Utc::now().timestamp();
         let notional = self.params.amount * self.params.leverage;
 
         let (tp_price, sl_price) = match direction {
@@ -267,7 +266,7 @@ impl TestTradingFramework {
         let new_trade = Trade {
             direction,
             open_price: price,
-            open_time: now_ts,
+            open_time: current_ts,
             close_price: None,
             close_time: None,
             notional,
