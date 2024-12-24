@@ -367,9 +367,9 @@ impl DualChannelTradingBot {
     }
 
     async fn place_tp_sl_orders(&self, size: f64, is_buy: bool, tp_price: f64, sl_price: f64) {
-        if tp_price == 0.0 || sl_price == 0.0 {
-            return;
-        }
+        // if tp_price == 0.0 || sl_price == 0.0 {
+        //     return;
+        // }
 
         // Place Take Profit order
         let tp_order = self
