@@ -236,7 +236,6 @@ pub async fn close_position(
             ExchangeResponseStatus::Err(e) => {
                 error!("Error closing position: {}", e);
             }
-            _ => {}
         }
     }
     Ok(())

@@ -1,27 +1,17 @@
 use std::str::FromStr;
 
-use chrono::Utc;
 use clap::Parser;
 use dotenvy::dotenv;
-use dual_channel_bot::utils::{
-        check_account_position,
-        create_trade,
-        BotParams,
-        TradingAccount,
-    };
 use ethers::{signers::LocalWallet, types::H160};
 use eyre::Ok;
 use hyperliquid_rust_sdk::{
-    BaseUrl, ExchangeClient, InfoClient, Message, Subscription, TradeInfo,
-    UserData,
+    BaseUrl, ExchangeClient, InfoClient, Message, Subscription, TradeInfo, UserData,
 };
-use tokio::{
-    select, signal,
-    sync::mpsc::unbounded_channel,
-    time::interval,
-};
+use tokio::{select, signal, sync::mpsc::unbounded_channel, time::interval};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
+
+use dual_channel_bot::utils::{check_account_position, create_trade, BotParams, TradingAccount};
 
 /// We'll print stats every 5 minutes
 const STATS_INTERVAL_SECS: u64 = 300;
@@ -47,9 +37,6 @@ struct Args {
     #[arg(long, default_value_t = 900)]
     timeout_sec: u64,
 
-    #[arg(long, default_value_t = 0.000432)]
-    fees: f64,
-
     #[arg(long, default_value = "HYPE")]
     asset: String,
 }
@@ -63,7 +50,6 @@ struct DualAccountBot {
     info_client: InfoClient,
     latest_price: f64,
     total_pnl: f64,
-    last_stats_time: i64,
 }
 
 /// Minimal struct to hold our simulation parameters
@@ -74,7 +60,6 @@ struct SimParams {
     tp_percent: f64,
     sl_percent: f64,
     timeout_sec: u64,
-    fees: f64,
 }
 
 /// Convert our local `SimParams` into the `BotParams` used by `utils`
@@ -133,7 +118,6 @@ impl DualAccountBot {
             info_client,
             latest_price: 0.0,
             total_pnl: 0.0,
-            last_stats_time: Utc::now().timestamp(),
         })
     }
 
@@ -303,7 +287,6 @@ async fn main() -> eyre::Result<()> {
         tp_percent: args.tp_percent,
         sl_percent: args.sl_percent,
         timeout_sec: args.timeout_sec,
-        fees: args.fees,
     };
 
     info!(
