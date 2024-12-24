@@ -7,11 +7,14 @@ use eyre::Ok;
 use hyperliquid_rust_sdk::{
     BaseUrl, ExchangeClient, InfoClient, Message, Subscription, TradeInfo, UserData,
 };
-use tokio::{select, signal, sync::{mpsc::unbounded_channel, watch}, time::interval};
+use tokio::{select, signal, sync::mpsc::unbounded_channel, time::interval};
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
-use dual_channel_bot::utils::{check_account_position, create_trade, BotParams, TradingAccount};
+use dual_channel_bot::{
+    get_price,
+    utils::{check_account_position, create_trade, BotParams, TradingAccount},
+};
 
 /// We'll print stats every 5 minutes
 const STATS_INTERVAL_SECS: u64 = 300;
@@ -129,7 +132,6 @@ impl DualAccountBot {
     }
 
     async fn start(&mut self, network: BaseUrl) -> eyre::Result<()> {
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let (sender, mut receiver) = unbounded_channel();
 
         // Subscribe to market data
@@ -150,20 +152,13 @@ impl DualAccountBot {
             )
             .await?;
 
-        // Spawn a task to listen for `Ctrl+C` and send a shutdown signal
-        tokio::spawn(async move {
-            signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
-            let _ = shutdown_tx.send(true); // Notify shutdown
-            info!("Shutdown signal received. Exiting...");
-        });
-
         // Wait for initial price
         info!("Waiting for initial price data...");
         loop {
             let message = receiver.recv().await.unwrap();
             if let Message::AllMids(all_mids) = message {
                 if let Some(mid) = all_mids.data.mids.get(&self.asset) {
-                    self.latest_price = mid.parse()?;
+                    self.latest_price = get_price(mid.parse()?);
                     if self.latest_price > 0.0 {
                         info!("Initial price received: {}", self.latest_price);
                         break;
@@ -184,17 +179,11 @@ impl DualAccountBot {
         loop {
             let result = async {
                 select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            info!("Shutdown detected. Exiting main loop...");
-                            return Ok(());
-                        }
-                    }
                     Some(msg) = receiver.recv() => {
                         match msg {
                             Message::AllMids(all_mids) => {
                                 if let Some(mid) = all_mids.data.mids.get(&self.asset) {
-                                    self.latest_price = mid.parse()?;
+                                    self.latest_price = get_price(mid.parse()?);
                                     let long_is_long_account = self.long_account.is_long_account;
                                     check_account_position(
                                         &mut self.long_account,
@@ -240,7 +229,7 @@ impl DualAccountBot {
 
             if let Err(e) = result {
                 error!("Error occurred: {}", e);
-                self.handle_reconnection(&network).await?;
+                // self.handle_reconnection(&network).await?;
             }
         }
     }
