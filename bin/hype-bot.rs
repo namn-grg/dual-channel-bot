@@ -8,7 +8,7 @@ use hyperliquid_rust_sdk::{
     BaseUrl, ExchangeClient, InfoClient, Message, Subscription, TradeInfo, UserData,
 };
 use tokio::{select, signal, sync::mpsc::unbounded_channel, time::interval};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 use dual_channel_bot::utils::{check_account_position, create_trade, BotParams, TradingAccount};
@@ -121,8 +121,14 @@ impl DualAccountBot {
         })
     }
 
-    /// The main run loop
-    async fn start(&mut self) -> eyre::Result<()> {
+    /// Helper function to handle reconnection
+    async fn handle_reconnection(&mut self, network: &BaseUrl) -> eyre::Result<()> {
+        error!("Attempting to reconnect...");
+        self.reconnect_clients(network).await?;
+        Ok(())
+    }
+
+    async fn start(&mut self, network: BaseUrl) -> eyre::Result<()> {
         let (sender, mut receiver) = unbounded_channel();
 
         // Subscribe to market data
@@ -158,71 +164,71 @@ impl DualAccountBot {
             }
         }
 
-        // --- Open initial positions ---
-        // Build a trade for the long account
+        // Open initial positions
         let long_trade = create_trade(true, self.latest_price, &BotParams::from(&self.params));
         self.long_account.open_position(long_trade, &self.asset).await?;
 
-        // Build a trade for the short account
         let short_trade = create_trade(false, self.latest_price, &BotParams::from(&self.params));
         self.short_account.open_position(short_trade, &self.asset).await?;
 
-        // We'll print stats every STATS_INTERVAL_SECS
         let mut stats_interval = interval(std::time::Duration::from_secs(STATS_INTERVAL_SECS));
 
         loop {
-            select! {
-                Some(msg) = receiver.recv() => {
-                    match msg {
-                        Message::AllMids(all_mids) => {
-                            if let Some(mid) = all_mids.data.mids.get(&self.asset) {
-                                self.latest_price = mid.parse()?;
-                                // Instead of `self.check_account_position(...)`,
-                                // we call the free function from `utils`.
-                                // Process the long account
-                                let long_is_long_account = self.long_account.is_long_account; // Extract field
-                                check_account_position(
-                                    &mut self.long_account,
-                                    self.latest_price,
-                                    self.params.timeout_sec,
-                                    long_is_long_account, // Use local variable
-                                    &mut self.total_pnl,
-                                    &self.asset,
-                                    &BotParams::from(&self.params),
-                                ).await?;
+            let result = async {
+                select! {
+                    Some(msg) = receiver.recv() => {
+                        match msg {
+                            Message::AllMids(all_mids) => {
+                                if let Some(mid) = all_mids.data.mids.get(&self.asset) {
+                                    self.latest_price = mid.parse()?;
+                                    let long_is_long_account = self.long_account.is_long_account;
+                                    check_account_position(
+                                        &mut self.long_account,
+                                        self.latest_price,
+                                        self.params.timeout_sec,
+                                        long_is_long_account,
+                                        &mut self.total_pnl,
+                                        &self.asset,
+                                        &BotParams::from(&self.params),
+                                    ).await?;
 
-                                // Process the short account
-                                let short_is_long_account = self.short_account.is_long_account; // Extract field
-                                check_account_position(
-                                    &mut self.short_account,
-                                    self.latest_price,
-                                    self.params.timeout_sec,
-                                    short_is_long_account, // Use local variable
-                                    &mut self.total_pnl,
-                                    &self.asset,
-                                    &BotParams::from(&self.params),
-                                ).await?;
+                                    let short_is_long_account = self.short_account.is_long_account;
+                                    check_account_position(
+                                        &mut self.short_account,
+                                        self.latest_price,
+                                        self.params.timeout_sec,
+                                        short_is_long_account,
+                                        &mut self.total_pnl,
+                                        &self.asset,
+                                        &BotParams::from(&self.params),
+                                    ).await?;
+                                }
                             }
-                        }
-                        Message::User(user_events) => {
-                            if let UserData::Fills(fills) = user_events.data {
-                                self.handle_fills(fills).await?;
+                            Message::User(user_events) => {
+                                if let UserData::Fills(fills) = user_events.data {
+                                    self.handle_fills(fills).await?;
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
+                    }
+                    _ = stats_interval.tick() => {
+                        self.print_statistics();
+                    }
+                    _ = signal::ctrl_c() => {
+                        info!("Shutting down...");
+                        return Ok(());
                     }
                 }
-                _ = stats_interval.tick() => {
-                    self.print_statistics();
-                }
-                _ = signal::ctrl_c() => {
-                    info!("Shutting down...");
-                    break;
-                }
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = result {
+                error!("Error occurred: {}", e);
+                self.handle_reconnection(&network).await?;
             }
         }
-
-        Ok(())
     }
 
     /// Handle fill events (optional / example usage)
@@ -238,6 +244,38 @@ impl DualAccountBot {
                 price
             );
         }
+        Ok(())
+    }
+
+    /// Reconnect the InfoClient and ExchangeClients in case of disconnection
+    async fn reconnect_clients(&mut self, network: &BaseUrl) -> eyre::Result<()> {
+        info!("Reconnecting InfoClient and ExchangeClients...");
+
+        // Attempt to recreate InfoClient
+        self.info_client = InfoClient::new(None, Some(network.clone())).await?;
+
+        // Attempt to recreate ExchangeClient for long account
+        self.long_account.exchange_client = ExchangeClient::new(
+            None,
+            self.long_account.wallet.clone(),
+            Some(network.clone()),
+            None,
+            None,
+        )
+        .await?;
+
+        // Attempt to recreate ExchangeClient for short account
+        self.short_account.exchange_client = ExchangeClient::new(
+            None,
+            self.short_account.wallet.clone(),
+            Some(network.clone()),
+            None,
+            None,
+        )
+        .await?;
+
+        info!("Reconnection successful.");
+
         Ok(())
     }
 
@@ -308,7 +346,7 @@ async fn main() -> eyre::Result<()> {
     .await?;
 
     // Start the main run-loop
-    bot.start().await?;
+    bot.start(network).await?;
 
     Ok(())
 }
