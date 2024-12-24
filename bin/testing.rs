@@ -1,19 +1,15 @@
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use hyperliquid_rust_sdk::{BaseUrl, InfoClient, Message, Subscription};
-use serde::{Deserialize, Serialize};
-use std::{
-    fs::File,
-    io::{BufReader, BufWriter},
-};
 use tokio::{select, signal, sync::mpsc::unbounded_channel, time::interval};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use dual_channel_bot::caching::{load_ticks_from_cache, store_tick_to_cache};
+
 // =============================================================
 //  CLI + Enums
 // =============================================================
-
 #[derive(ValueEnum, Clone, Debug)]
 enum RunMode {
     Live,
@@ -21,6 +17,7 @@ enum RunMode {
 }
 
 const PRINT_STATS_INTERVAL: u64 = 300; // 5 minutes in seconds
+const CACHE_DIR: &str = ".cache";
 
 /// Our CLI arguments
 #[derive(Parser, Debug)]
@@ -29,11 +26,6 @@ struct Args {
     #[arg(long, value_enum, default_value_t = RunMode::Live)]
     mode: RunMode,
 
-    /// Path for the cache file
-    #[arg(long, default_value = "price_cache.json")]
-    cache_file: String,
-
-    // Add any additional parameters you want (like `amount`, `tp_percent`, etc.)
     #[arg(long, default_value_t = 10.0)]
     amount: f64,
 
@@ -52,17 +44,15 @@ struct Args {
     #[arg(long, default_value_t = 0.000432)] // 0.0432%
     fees: f64,
     // In real usage, you'd have `--mainnet` or other arguments from your main code
+
+    /// Name of the asset to trade (eg: HYPE)
+    #[arg(long, default_value = "HYPE")]
+    asset: String,
 }
 
 // =============================================================
 //  Data Structures for Price Caching & Simulation
 // =============================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PriceTick {
-    timestamp: i64, // or DateTime
-    price: f64,
-}
 
 /// If you want to store more info (like best bid/ask, volume, etc.),
 /// extend this struct with additional fields. For simplicity, we only store “price”.
@@ -225,6 +215,7 @@ impl TestTradingFramework {
         }
     }
 
+    /// Close the specified `trade` at the given `exit_price`.
     fn close_trade(&mut self, trade: Trade, exit_price: f64) {
         // same logic as before...
         let direction_str = match trade.direction {
@@ -362,6 +353,7 @@ async fn main() -> eyre::Result<()> {
         timeout_sec: args.timeout_sec,
         fees: args.fees,
     };
+    let cache_path = format!("{}/{}.json", CACHE_DIR, args.asset);
 
     // Create our test framework
     let mut framework = TestTradingFramework::new(sim_params);
@@ -404,7 +396,7 @@ async fn main() -> eyre::Result<()> {
                                 // 2) forward to test framework
                                 framework.on_price_update(price);
                                 // 3) store this tick in the cache
-                                store_tick_to_cache(&args.cache_file, price)?;
+                                store_tick_to_cache(&cache_path, price)?;
                             }
                         }
                     },
@@ -425,8 +417,8 @@ async fn main() -> eyre::Result<()> {
         }
         RunMode::Cached => {
             // 1) Load all PriceTicks from the cache file
-            info!("Running in CACHED mode. Reading from {}", args.cache_file);
-            let price_ticks = load_ticks_from_cache(&args.cache_file)?;
+            info!("Running in CACHED mode. Reading from {}", cache_path);
+            let price_ticks = load_ticks_from_cache(&cache_path)?;
 
             // 2) Use the first tick to open initial trades
             if price_ticks.is_empty() {
@@ -447,34 +439,4 @@ async fn main() -> eyre::Result<()> {
     }
 
     Ok(())
-}
-
-// =============================================================
-//  Caching Functions (JSON-based for simplicity)
-// =============================================================
-
-fn store_tick_to_cache(path: &str, price: f64) -> eyre::Result<()> {
-    // Append new tick to existing file
-    // For efficiency, you might keep the file open in streaming mode,
-    // or buffer updates in memory. This is a simplistic example.
-
-    // 1) Read existing ticks
-    let mut ticks = load_ticks_from_cache(path).unwrap_or_else(|_| Vec::new());
-
-    // 2) Add new tick
-    ticks.push(PriceTick { timestamp: Utc::now().timestamp(), price });
-
-    // 3) Write back the entire array
-    let file = File::create(path)?;
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, &ticks)?;
-
-    Ok(())
-}
-
-fn load_ticks_from_cache(path: &str) -> eyre::Result<Vec<PriceTick>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let ticks: Vec<PriceTick> = serde_json::from_reader(reader)?;
-    Ok(ticks)
 }
