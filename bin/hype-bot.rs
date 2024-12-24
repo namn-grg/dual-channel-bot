@@ -7,7 +7,7 @@ use eyre::Ok;
 use hyperliquid_rust_sdk::{
     BaseUrl, ExchangeClient, InfoClient, Message, Subscription, TradeInfo, UserData,
 };
-use tokio::{select, signal, sync::mpsc::unbounded_channel, time::interval};
+use tokio::{select, signal, sync::{mpsc::unbounded_channel, watch}, time::interval};
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -129,18 +129,19 @@ impl DualAccountBot {
     }
 
     async fn start(&mut self, network: BaseUrl) -> eyre::Result<()> {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let (sender, mut receiver) = unbounded_channel();
 
         // Subscribe to market data
         self.info_client.subscribe(Subscription::AllMids, sender.clone()).await?;
 
-        // Subscribe to user events for both accounts
-        self.info_client
-            .subscribe(
-                Subscription::UserEvents { user: self.long_account.user_address },
-                sender.clone(),
-            )
-            .await?;
+        // // Subscribe to user events for both accounts
+        // self.info_client
+        //     .subscribe(
+        //         Subscription::UserEvents { user: self.long_account.user_address },
+        //         sender.clone(),
+        //     )
+        //     .await?;
 
         self.info_client
             .subscribe(
@@ -148,6 +149,13 @@ impl DualAccountBot {
                 sender.clone(),
             )
             .await?;
+
+        // Spawn a task to listen for `Ctrl+C` and send a shutdown signal
+        tokio::spawn(async move {
+            signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+            let _ = shutdown_tx.send(true); // Notify shutdown
+            info!("Shutdown signal received. Exiting...");
+        });
 
         // Wait for initial price
         info!("Waiting for initial price data...");
@@ -176,6 +184,12 @@ impl DualAccountBot {
         loop {
             let result = async {
                 select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            info!("Shutdown detected. Exiting main loop...");
+                            return Ok(());
+                        }
+                    }
                     Some(msg) = receiver.recv() => {
                         match msg {
                             Message::AllMids(all_mids) => {
