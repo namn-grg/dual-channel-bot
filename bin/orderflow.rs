@@ -5,17 +5,16 @@ use ethers::{
     signers::{LocalWallet, Signer},
     types::H160,
 };
+use hyperliquid_rust_sdk::{
+    BaseUrl, CandleData, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
+    ExchangeDataStatus, ExchangeResponseStatus, InfoClient, Message, Subscription, UserData,
+};
 use tokio::{sync::mpsc::unbounded_channel, time::interval};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{field::debug, EnvFilter};
-use hyperliquid_rust_sdk::{
-    BaseUrl, CandleData, ClientLimit, ClientOrder,
-    ClientOrderRequest, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
-    Message, Subscription, UserData,
-};
 
 const MAKER_FEE: f64 = 0.0001; // 0.01%
-const TAKER_FEE: f64 = 0.00035; // 0.035%
+const TAKER_FEE: f64 = 0.00034; // 0.034%
 /// Print stats every 5 minutes
 const STATS_INTERVAL_SECS: u64 = 60;
 
@@ -97,9 +96,9 @@ impl OrderFlowTradingBot {
         order_size: f64,
         decimals: u32,
         wallet: LocalWallet,
+        user_address: H160,
     ) -> eyre::Result<Self> {
         debug!("Creating new OrderFlowTradingBot instance");
-        let user_address = wallet.address();
 
         // Build InfoClient and ExchangeClient
         let info_client = InfoClient::new(None, Some(BaseUrl::Mainnet))
@@ -148,8 +147,8 @@ impl OrderFlowTradingBot {
         // tokio::spawn(async move {
         //     loop {
         //         stats_interval.tick().await;
-        //         info!("Current position: {}, closed trades: {}", current_position, closed_trades_len);
-        //     }
+        //         info!("Current position: {}, closed trades: {}", current_position,
+        // closed_trades_len);     }
         // });
 
         // Main message loop
@@ -277,7 +276,7 @@ impl OrderFlowTradingBot {
 
     /// Process an L2 order book update
     async fn process_order_book_update(&mut self, update: OrderBookUpdate) {
-        debug!("Processing order book update: {:?}", update);
+        // debug!("Processing order book update: {:?}", update);
         // For demonstration, we compute an order flow imbalance
         let imbalance = self.calculate_order_flow_imbalance(&update);
         info!("Order book imbalance calculated: {}", imbalance);
@@ -338,6 +337,7 @@ impl OrderFlowTradingBot {
         debug!("Generating trading signal");
         // Wait until we have enough data
         if self.hourly_candles.len() < 24 || self.five_min_candles.len() < 12 {
+            debug!("Insufficient data for trading signal generation");
             return;
         }
 
@@ -370,9 +370,13 @@ impl OrderFlowTradingBot {
 
         let entry_price = self.latest_mid_price;
 
-        // Position size: min of (requested size) and (max * risk_factor)
-        let position_size =
-            (self.order_size * signal).min(self.max_position_size * self.risk_factor);
+        // GPT generated
+        // Raw size can be positive (long) or negative (short).
+        let raw_size = self.order_size * signal;
+        // The maximum allowed magnitude.
+        let max_size = self.max_position_size * self.risk_factor;
+        // Limit the absolute value, then reapply the sign from `raw_size`.
+        let position_size = raw_size.abs().min(max_size) * raw_size.signum();
 
         // Format logs with decimals
         let formatted_entry_price = format!("{:.*}", self.decimals as usize, entry_price);
@@ -521,10 +525,14 @@ async fn main() -> eyre::Result<()> {
 
     debug!("Starting main function");
 
-    let private_key =
-        std::env::var("PRIVATE_KEY").map_err(|_| eyre::eyre!("Missing PRIVATE_KEY in .env"))?;
+    let private_key = std::env::var("PRIVATE_KEY_LONG")
+        .map_err(|_| eyre::eyre!("Missing PRIVATE_KEY in .env"))?;
     let wallet = LocalWallet::from_str(&private_key)
         .map_err(|e| eyre::eyre!("Invalid PRIVATE_KEY format: {}", e))?;
+    let user_address = std::env::var("USER_ADDRESS_LONG")
+        .map_err(|_| eyre::eyre!("Missing USER_ADDRESS_LONG in .env"))?
+        .parse()
+        .map_err(|e| eyre::eyre!("Invalid USER_ADDRESS format: {}", e))?;
 
     // Build and start the bot
     // Create a new instance of the OrderFlowTradingBot
@@ -534,9 +542,11 @@ async fn main() -> eyre::Result<()> {
         0.01,              // risk_factor
         0.1,               // order_size
         2,                 // decimals
-        wallet             // wallet
-    ).await?;
-    
+        wallet,            // wallet
+        user_address,      // user_address
+    )
+    .await?;
+
     bot.start().await?;
 
     Ok(())
