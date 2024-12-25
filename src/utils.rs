@@ -5,14 +5,13 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use tokio::time::sleep;
-use tracing::{debug, error, info};
-
 use ethers::{signers::LocalWallet, types::H160};
 use hyperliquid_rust_sdk::{
     ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient, ExchangeDataStatus,
     ExchangeResponseStatus,
 };
+use tokio::time::sleep;
+use tracing::{debug, error, info, trace};
 
 /// A small delay before re-opening a position after closing one
 pub const SLEEP_BEFORE_OPENING_POSITION: u64 = 3;
@@ -30,6 +29,80 @@ pub fn get_size(amount: f64, price: f64) -> f64 {
     let sz_decimals = 2;
     ((amount.abs() / price) * 10f64.powi(sz_decimals as i32)).round() /
         10f64.powi(sz_decimals as i32)
+}
+
+/// Utility function to print statistics for closed trades
+pub fn print_statistics(closed_trades: &Vec<Trade>) {
+    if closed_trades.is_empty() {
+        println!("No trades to summarize.");
+        return;
+    }
+
+    // Initialize counters and accumulators
+    let mut total_pnl = 0.0;
+    let mut total_profit = 0.0;
+    let mut total_loss = 0.0;
+    let mut profitable_trades = 0;
+    let mut loss_trades = 0;
+
+    println!("--------------- Trade Statistics ---------------");
+
+    // Process each trade
+    for (i, trade) in closed_trades.iter().enumerate() {
+        let trade_pnl = if let Some(close_price) = trade.close_price {
+            match trade.direction {
+                Direction::Long => (close_price - trade.entry_price) * trade.size,
+                Direction::Short => (trade.entry_price - close_price) * trade.size,
+            }
+        } else {
+            0.0 // Should not occur for closed trades
+        };
+
+        // Update statistics
+        total_pnl += trade_pnl;
+
+        if trade_pnl > 0.0 {
+            profitable_trades += 1;
+            total_profit += trade_pnl;
+        } else {
+            loss_trades += 1;
+            total_loss += trade_pnl;
+        }
+
+        // Calculate PnL percentage
+        let trade_pnl_percentage = if let Some(close_price) = trade.close_price {
+            match trade.direction {
+                Direction::Long => ((close_price - trade.entry_price) / trade.entry_price) * 100.0,
+                Direction::Short => ((trade.entry_price - close_price) / trade.entry_price) * 100.0,
+            }
+        } else {
+            0.0
+        };
+
+        // Print individual trade details
+        trace!(
+            "#{:<2} {:?} | Entry: {:.4}, Close: {:.4?}, Size: {:.2}, PnL%: {:.4}%",
+            i + 1,
+            trade.direction,
+            trade.entry_price,
+            trade.close_price.unwrap_or_default(),
+            trade.size,
+            trade_pnl_percentage
+        );
+    }
+
+    // Print summary
+    info!(
+        "Total Trades: {}, Profitable Trades: {}, Loss Trades: {}",
+        closed_trades.len(),
+        profitable_trades,
+        loss_trades
+    );
+    info!(
+        "Total PnL: ${:.4}, Total Profit: ${:.4}, Total Loss: ${:.4}",
+        total_pnl, total_profit, total_loss
+    );
+    println!("-------------------------------------------------");
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -102,6 +175,7 @@ pub struct TradingAccount {
     pub user_address: H160,
     pub active_trade: Option<Trade>,
     pub is_long_account: bool,
+    pub closed_trades: Vec<Trade>,
 }
 
 /// Creates a new `Trade` with the given direction, using your `BotParams`.
@@ -151,12 +225,14 @@ impl TradingAccount {
             .await?;
         debug!("Order response: {:?}", order);
 
+        // Not doing inside the fill block to avoid case when its resting and then filled.
+        self.active_trade = Some(trade);
+
         match order {
             ExchangeResponseStatus::Ok(response) => {
                 if let Some(data) = response.data {
                     match &data.statuses[0] {
                         ExchangeDataStatus::Filled(_) => {
-                            self.active_trade = Some(trade);
                             info!(
                                 "Opened {} position at {:.3} (TP: {:.3}, SL: {:.3})",
                                 if trade.direction == Direction::Long { "LONG" } else { "SHORT" },
@@ -225,6 +301,7 @@ pub async fn close_position(
                 };
 
                 *total_pnl += pnl;
+                account.closed_trades.push(trade);
 
                 info!(
                     "Closed {} position - Entry: {:.3}, Exit: {:.3}, PnL: {:.2}",

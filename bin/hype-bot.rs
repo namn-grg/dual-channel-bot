@@ -13,11 +13,11 @@ use tracing_subscriber::EnvFilter;
 
 use dual_channel_bot::{
     get_price,
-    utils::{check_account_position, create_trade, BotParams, TradingAccount},
+    utils::{check_account_position, create_trade, print_statistics, BotParams, TradingAccount},
 };
 
-/// We'll print stats every 5 minutes
-const STATS_INTERVAL_SECS: u64 = 300;
+/// Print stats every 5 minutes
+const STATS_INTERVAL_SECS: u64 = 60;
 
 /// CLI arguments
 #[derive(Parser, Debug)]
@@ -103,6 +103,7 @@ impl DualAccountBot {
             user_address: H160::from_str(&user_address_long)?,
             active_trade: None,
             is_long_account: true,
+            closed_trades: vec![],
         };
 
         let short_account = TradingAccount {
@@ -111,6 +112,7 @@ impl DualAccountBot {
             user_address: H160::from_str(&user_address_short)?,
             active_trade: None,
             is_long_account: false,
+            closed_trades: vec![],
         };
 
         Ok(Self {
@@ -137,7 +139,7 @@ impl DualAccountBot {
         // Subscribe to market data
         self.info_client.subscribe(Subscription::AllMids, sender.clone()).await?;
 
-        // // Subscribe to user events for both accounts
+        // Subscribe to user events for both accounts
         // self.info_client
         //     .subscribe(
         //         Subscription::UserEvents { user: self.long_account.user_address },
@@ -184,6 +186,8 @@ impl DualAccountBot {
                             Message::AllMids(all_mids) => {
                                 if let Some(mid) = all_mids.data.mids.get(&self.asset) {
                                     self.latest_price = get_price(mid.parse()?);
+                                    self.print_current_pnl();
+
                                     let long_is_long_account = self.long_account.is_long_account;
                                     check_account_position(
                                         &mut self.long_account,
@@ -216,11 +220,12 @@ impl DualAccountBot {
                         }
                     }
                     _ = stats_interval.tick() => {
-                        self.print_statistics();
+                        print_statistics(&self.long_account.closed_trades);
+                        print_statistics(&self.short_account.closed_trades);
                     }
                     _ = signal::ctrl_c() => {
                         info!("Shutting down...");
-                        return Ok(());
+                        return Err(eyre::eyre!("Shutting down"));
                     }
                 }
                 Ok(())
@@ -229,6 +234,7 @@ impl DualAccountBot {
 
             if let Err(e) = result {
                 error!("Error occurred: {}", e);
+                break Ok(());
                 // self.handle_reconnection(&network).await?;
             }
         }
@@ -282,19 +288,34 @@ impl DualAccountBot {
         Ok(())
     }
 
-    /// Print periodic stats
-    fn print_statistics(&self) {
-        info!(
-            "\n===== Trading Statistics =====\n\
-             Total PnL: ${:.2}\n\
-             Current Price: {:.3}\n\
-             Long Position: {:?}\n\
-             Short Position: {:?}\n",
-            self.total_pnl,
-            self.latest_price,
-            self.long_account.active_trade,
-            self.short_account.active_trade
-        );
+    /// Print the current PnL of the long and short accounts.
+    /// We calculate unrealized PnL as:
+    ///     PnL = (current_price - entry_price) / entry_price * 100  (for Long positions)
+    ///     PnL = (entry_price - current_price) / entry_price * 100  (for Short positions)
+    fn print_current_pnl(&self) {
+        let current_price = self.latest_price;
+
+        // Print LONG account PnL
+        if let Some(trade) = &self.long_account.active_trade {
+            let pnl = (current_price - trade.entry_price) / trade.entry_price * 100.0;
+            debug!(
+                "LONG Account: Entry Price={:.4}, Current Price={:.4}, PnL={:.4}%",
+                trade.entry_price, current_price, pnl
+            );
+        } else {
+            debug!("LONG Account: No active trade.");
+        }
+
+        // Print SHORT account PnL
+        if let Some(trade) = &self.short_account.active_trade {
+            let pnl = (trade.entry_price - current_price) / trade.entry_price * 100.0;
+            debug!(
+                "SHORT Account: Entry Price={:.4}, Current Price={:.4}, PnL={:.4}",
+                trade.entry_price, current_price, pnl
+            );
+        } else {
+            debug!("SHORT Account: No active trade.");
+        }
     }
 }
 

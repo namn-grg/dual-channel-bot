@@ -31,3 +31,7 @@ path = "bin/testing.rs"
 [[bin]]
 name = "hype-bot"
 path = "bin/hype-bot.rs"
+
+[[bin]]
+name = "orderflow"
+path = "bin/orderflow.rs"
