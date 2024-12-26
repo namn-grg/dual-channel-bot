@@ -1,17 +1,15 @@
 use std::{collections::VecDeque, str::FromStr};
 
 use dotenvy::dotenv;
-use ethers::{
-    signers::{LocalWallet, Signer},
-    types::H160,
-};
+use dual_channel_bot::{caching::store_candle_to_cache, get_price, store_tick_to_cache};
+use ethers::{signers::LocalWallet, types::H160};
 use hyperliquid_rust_sdk::{
     BaseUrl, CandleData, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
     ExchangeDataStatus, ExchangeResponseStatus, InfoClient, Message, Subscription, UserData,
 };
-use tokio::{sync::mpsc::unbounded_channel, time::interval};
-use tracing::{debug, error, info, warn};
-use tracing_subscriber::{field::debug, EnvFilter};
+use tokio::sync::mpsc::unbounded_channel;
+use tracing::{debug, error, info, trace, warn};
+use tracing_subscriber::EnvFilter;
 
 const MAKER_FEE: f64 = 0.0001; // 0.01%
 const TAKER_FEE: f64 = 0.00034; // 0.034%
@@ -105,7 +103,7 @@ impl OrderFlowTradingBot {
             .await
             .map_err(|e| eyre::eyre!("Failed to create InfoClient: {}", e))?;
 
-        let exchange_client = ExchangeClient::new(None, wallet, Some(BaseUrl::Testnet), None, None)
+        let exchange_client = ExchangeClient::new(None, wallet, Some(BaseUrl::Mainnet), None, None)
             .await
             .map_err(|e| eyre::eyre!("Failed to create ExchangeClient: {}", e))?;
 
@@ -151,6 +149,8 @@ impl OrderFlowTradingBot {
         // closed_trades_len);     }
         // });
 
+        let (tick_cache_path, candle_cache_path) = self.get_cache_paths();
+
         // Main message loop
         while let Some(message) = receiver.recv().await {
             match message {
@@ -158,8 +158,12 @@ impl OrderFlowTradingBot {
                     if let Some(mid) = all_mids.data.mids.get(&self.asset) {
                         match mid.parse::<f64>() {
                             Ok(px) => {
-                                self.latest_mid_price = px;
+                                self.latest_mid_price = get_price(px, 0.1);
                                 self.check_stop_loss_take_profit().await;
+
+                                if let Err(e) = store_tick_to_cache(&tick_cache_path, px) {
+                                    error!("Failed to store tick: {}", e);
+                                }
                                 debug!("Received mid price: {}", px);
                             }
                             Err(e) => {
@@ -193,7 +197,11 @@ impl OrderFlowTradingBot {
                     self.process_order_book_update(update).await;
                 }
                 Message::Candle(candle) => {
-                    self.process_candle(candle.data).await;
+                    self.process_candle(candle.data.clone()).await;
+
+                    if let Err(e) = store_candle_to_cache(&candle_cache_path, &candle.data) {
+                        error!("Failed to store candle: {}", e);
+                    }
                 }
                 _ => {
                     // Unhandled message type - you might want to log or ignore
@@ -279,7 +287,7 @@ impl OrderFlowTradingBot {
         // debug!("Processing order book update: {:?}", update);
         // For demonstration, we compute an order flow imbalance
         let imbalance = self.calculate_order_flow_imbalance(&update);
-        info!("Order book imbalance calculated: {}", imbalance);
+        trace!("Order book imbalance calculated: {}", imbalance);
 
         // You could incorporate imbalance logic in `generate_trading_signal` or separate
         // step to refine your strategy.
@@ -337,7 +345,11 @@ impl OrderFlowTradingBot {
         debug!("Generating trading signal");
         // Wait until we have enough data
         if self.hourly_candles.len() < 24 || self.five_min_candles.len() < 12 {
-            debug!("Insufficient data for trading signal generation");
+            debug!(
+                "Insufficient data for trading signal generation 24h: {}, 5m: {}",
+                self.hourly_candles.len(),
+                self.five_min_candles.len()
+            );
             return;
         }
 
@@ -352,6 +364,11 @@ impl OrderFlowTradingBot {
         } else {
             0.0 // Neutral
         };
+
+        debug!(
+            "Trading signal generated: {} Hourly VWAP: {}, 5m VWAP: {}",
+            signal, hourly_vwap, five_min_vwap
+        );
 
         // If a signal appears and there's no open trade, attempt to open one
         if signal != 0.0 && self.current_trade.is_none() {
@@ -415,7 +432,15 @@ impl OrderFlowTradingBot {
             // Store the trade
             self.current_trade = Some(Trade { entry_price, position_size, stop_loss, take_profit });
 
-            info!("Trade placed with stop loss: {:.4}, take profit: {:.4}", stop_loss, take_profit);
+            // Print trade
+            info!(
+                "Trade placed: {} at price: {}, position size: {}, SL: {}, TP: {}",
+                if signal > 0.0 { "Long" } else { "Short" },
+                formatted_entry_price,
+                formatted_position_size,
+                stop_loss,
+                take_profit
+            );
         } else {
             info!("Trade not placed due to unfavorable risk-reward ratio.");
         }
@@ -423,18 +448,19 @@ impl OrderFlowTradingBot {
 
     /// Check if SL/TP conditions are met
     async fn check_stop_loss_take_profit(&mut self) {
-        debug!("Checking stop loss and take profit conditions");
         if let Some(trade) = &self.current_trade {
             // Stop Loss
             if (trade.position_size > 0.0 && self.latest_mid_price <= trade.stop_loss) ||
                 (trade.position_size < 0.0 && self.latest_mid_price >= trade.stop_loss)
             {
+                debug!("Stop Loss hit at price: {}", self.latest_mid_price);
                 self.exit_trade(self.latest_mid_price).await;
             }
             // Take Profit
             else if (trade.position_size > 0.0 && self.latest_mid_price >= trade.take_profit) ||
                 (trade.position_size < 0.0 && self.latest_mid_price <= trade.take_profit)
             {
+                debug!("Take Profit hit at price: {}", self.latest_mid_price);
                 self.exit_trade(self.latest_mid_price).await;
             }
         }
@@ -511,6 +537,12 @@ impl OrderFlowTradingBot {
         }
 
         Ok(())
+    }
+
+    fn get_cache_paths(&self) -> (String, String) {
+        let tick_cache_path = format!(".cache/{}", self.asset);
+        let candle_cache_path = format!(".cache/{}_candles", self.asset);
+        (tick_cache_path, candle_cache_path)
     }
 }
 

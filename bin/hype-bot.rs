@@ -160,7 +160,7 @@ impl DualAccountBot {
             let message = receiver.recv().await.unwrap();
             if let Message::AllMids(all_mids) = message {
                 if let Some(mid) = all_mids.data.mids.get(&self.asset) {
-                    self.latest_price = get_price(mid.parse()?);
+                    self.latest_price = get_price(mid.parse()?, 0.001);
                     if self.latest_price > 0.0 {
                         info!("Initial price received: {}", self.latest_price);
                         break;
@@ -185,7 +185,7 @@ impl DualAccountBot {
                         match msg {
                             Message::AllMids(all_mids) => {
                                 if let Some(mid) = all_mids.data.mids.get(&self.asset) {
-                                    self.latest_price = get_price(mid.parse()?);
+                                    self.latest_price = get_price(mid.parse()?, 0.001);
                                     self.print_current_pnl();
 
                                     let long_is_long_account = self.long_account.is_long_account;
