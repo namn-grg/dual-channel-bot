@@ -1,0 +1,23 @@
+[bot]
+# Trading pair symbol
+asset = "ETH"
+# Initial capital in USD
+capital = 1000.0
+# Risk per trade as percentage of capital (e.g. 10% = 0.1)
+risk_per_trade = 0.1
+# Leverage multiplier
+leverage = 20.0
+# Decimal places for price/size rounding
+decimals = 2
+# Whether to run in test mode (no real trades)
+test_mode = true
+
+[risk]
+# Stop loss and take profit as percentage
+stop_loss = 0.01  # 1%
+take_profit = 0.02  # 2%
+
+[vwap]
+# Number of periods to keep for VWAP calculation
+hourly_periods = 24
+five_min_periods = 12 

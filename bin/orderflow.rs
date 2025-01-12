@@ -1,20 +1,50 @@
-use std::{collections::VecDeque, str::FromStr};
+use std::{collections::VecDeque, fs, str::FromStr};
 
 use dotenvy::dotenv;
-use dual_channel_bot::{caching::store_candle_to_cache, get_price, store_tick_to_cache};
 use ethers::{signers::LocalWallet, types::H160};
 use hyperliquid_rust_sdk::{
     BaseUrl, CandleData, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
     ExchangeDataStatus, ExchangeResponseStatus, InfoClient, Message, Subscription, UserData,
 };
+use serde::Deserialize;
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 
+use dual_channel_bot::{caching::store_candle_to_cache, get_price, store_tick_to_cache};
+
 const MAKER_FEE: f64 = 0.0001; // 0.01%
 const TAKER_FEE: f64 = 0.00034; // 0.034%
-/// Print stats every 5 minutes
-const STATS_INTERVAL_SECS: u64 = 60;
+const STATS_INTERVAL_SECS: u64 = 60; // Print stats every minute
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    bot: BotConfig,
+    risk: RiskConfig,
+    vwap: VwapConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct BotConfig {
+    asset: String,
+    capital: f64,
+    risk_per_trade: f64,
+    leverage: f64,
+    decimals: u32,
+    test_mode: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RiskConfig {
+    stop_loss: f64,
+    take_profit: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct VwapConfig {
+    hourly_periods: usize,
+    five_min_periods: usize,
+}
 
 #[derive(Debug)]
 /// Simple struct to hold order book updates: bids and asks
@@ -56,15 +86,15 @@ struct Trade {
     position_size: f64,
     stop_loss: f64,
     take_profit: f64,
+    pnl: f64,
+    fees_paid: f64,
 }
 
 /// Main bot struct
 pub struct OrderFlowTradingBot {
-    asset: String,
-    max_position_size: f64,
-    risk_factor: f64,
-    order_size: f64,
-    decimals: u32,
+    config: Config,
+    capital: f64,         // Current capital after PnL
+    initial_capital: f64, // Starting capital
 
     current_position: f64,
     latest_mid_price: f64,
@@ -81,46 +111,54 @@ pub struct OrderFlowTradingBot {
 
     // Clients & user address
     info_client: InfoClient,
-    exchange_client: ExchangeClient,
-    user_address: H160,
+    exchange_client: Option<ExchangeClient>,
+    user_address: Option<H160>,
 }
 
 impl OrderFlowTradingBot {
     /// Constructor
     pub async fn new(
-        asset: String,
-        max_position_size: f64,
-        risk_factor: f64,
-        order_size: f64,
-        decimals: u32,
-        wallet: LocalWallet,
-        user_address: H160,
+        config_path: &str,
+        wallet: Option<LocalWallet>,
+        user_address: Option<H160>,
     ) -> eyre::Result<Self> {
         debug!("Creating new OrderFlowTradingBot instance");
+
+        // Load and parse config
+        let config_str = fs::read_to_string(config_path)?;
+        let config: Config = toml::from_str(&config_str)?;
 
         // Build InfoClient and ExchangeClient
         let info_client = InfoClient::new(None, Some(BaseUrl::Mainnet))
             .await
             .map_err(|e| eyre::eyre!("Failed to create InfoClient: {}", e))?;
 
-        let exchange_client = ExchangeClient::new(None, wallet, Some(BaseUrl::Mainnet), None, None)
-            .await
-            .map_err(|e| eyre::eyre!("Failed to create ExchangeClient: {}", e))?;
+        let exchange_client = if !config.bot.test_mode {
+            if let (Some(wallet), Some(_addr)) = (wallet, user_address) {
+                Some(
+                    ExchangeClient::new(None, wallet, Some(BaseUrl::Mainnet), None, None)
+                        .await
+                        .map_err(|e| eyre::eyre!("Failed to create ExchangeClient: {}", e))?,
+                )
+            } else {
+                return Err(eyre::eyre!("Wallet and user address required for live trading"));
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
-            asset,
-            max_position_size,
-            risk_factor,
-            order_size,
-            decimals,
+            initial_capital: config.bot.capital,
+            capital: config.bot.capital,
+            config,
 
             current_position: 0.0,
             latest_mid_price: -1.0,
             current_trade: None,
             closed_trades: Vec::new(),
 
-            hourly_candles: VecDeque::new(),
-            five_min_candles: VecDeque::new(),
+            hourly_candles: VecDeque::with_capacity(24),
+            five_min_candles: VecDeque::with_capacity(12),
             hourly_vwap: VWAP::new(),
             five_min_vwap: VWAP::new(),
 
@@ -128,6 +166,184 @@ impl OrderFlowTradingBot {
             exchange_client,
             user_address,
         })
+    }
+
+    /// Calculate position size based on risk and capital
+    fn calculate_position_size(&self, entry_price: f64) -> f64 {
+        let risk_amount = self.capital * self.config.bot.risk_per_trade;
+        let position_value = risk_amount * self.config.bot.leverage;
+        position_value / entry_price
+    }
+
+    /// Place an order - either real or simulated
+    async fn place_order(&self, size: f64, price: f64) -> eyre::Result<()> {
+        let is_buy = size > 0.0;
+        let fees = if is_buy { TAKER_FEE } else { MAKER_FEE };
+        let fee_amount = price * size.abs() * fees;
+
+        if self.config.bot.test_mode {
+            info!(
+                "[TEST] {} order: size={}, price={}, fees={}",
+                if is_buy { "Buy" } else { "Sell" },
+                size.abs(),
+                price,
+                fee_amount
+            );
+            Ok(())
+        } else if let Some(exchange_client) = &self.exchange_client {
+            let order_request = ClientOrderRequest {
+                asset: self.config.bot.asset.clone(),
+                is_buy,
+                reduce_only: false,
+                limit_px: price,
+                sz: size.abs(),
+                cloid: None,
+                order_type: ClientOrder::Limit(ClientLimit { tif: "Gtc".to_string() }),
+            };
+
+            match exchange_client.order(order_request, None).await {
+                Ok(ExchangeResponseStatus::Ok(order_response)) => {
+                    if let Some(order_data) = order_response.data {
+                        match &order_data.statuses[0] {
+                            ExchangeDataStatus::Filled(filled_order) => {
+                                info!(
+                                    "Order filled: {} {} {} at {}",
+                                    if is_buy { "Bought" } else { "Sold" },
+                                    size.abs(),
+                                    self.config.bot.asset,
+                                    price
+                                );
+                            }
+                            ExchangeDataStatus::Resting(_) => {
+                                info!(
+                                    "Order resting: {} {} {} at {}",
+                                    if is_buy { "Buy" } else { "Sell" },
+                                    size.abs(),
+                                    self.config.bot.asset,
+                                    price
+                                );
+                            }
+                            ExchangeDataStatus::Error(e) => {
+                                error!("Error placing order: {}", e);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(ExchangeResponseStatus::Err(e)) => {
+                    error!("Error placing order: {}", e);
+                }
+                Err(e) => {
+                    error!("Error placing order: {}", e);
+                }
+            }
+            Ok(())
+        } else {
+            Err(eyre::eyre!("Exchange client not initialized"))
+        }
+    }
+
+    /// Enter a trade if risk/reward looks decent
+    async fn enter_trade(&mut self, signal: f64) {
+        debug!("Entering trade with signal: {}", signal);
+        if self.latest_mid_price <= 0.0 {
+            warn!("No valid mid price available to enter trade.");
+            return;
+        }
+
+        let entry_price = self.latest_mid_price;
+        let position_size = self.calculate_position_size(entry_price) * signal.signum();
+
+        // Calculate stop loss and take profit based on risk config
+        let stop_loss = if signal > 0.0 {
+            entry_price * (1.0 - self.config.risk.stop_loss)
+        } else {
+            entry_price * (1.0 + self.config.risk.stop_loss)
+        };
+
+        let take_profit = if signal > 0.0 {
+            entry_price * (1.0 + self.config.risk.take_profit)
+        } else {
+            entry_price * (1.0 - self.config.risk.take_profit)
+        };
+
+        // Format logs with decimals
+        let formatted_entry_price =
+            format!("{:.*}", self.config.bot.decimals as usize, entry_price);
+        let formatted_position_size =
+            format!("{:.*}", self.config.bot.decimals as usize, position_size.abs());
+
+        info!(
+            "Entering trade: {} at price: {}, position size: {}",
+            if signal > 0.0 { "Long" } else { "Short" },
+            formatted_entry_price,
+            formatted_position_size
+        );
+
+        // Place the order
+        if let Err(e) = self.place_order(position_size, entry_price).await {
+            error!("Failed to place opening order: {}", e);
+            return;
+        }
+
+        // Store the trade
+        self.current_trade = Some(Trade {
+            entry_price,
+            position_size,
+            stop_loss,
+            take_profit,
+            pnl: 0.0,
+            fees_paid: entry_price * position_size.abs() * TAKER_FEE,
+        });
+
+        info!(
+            "Trade placed: {} at price: {}, position size: {}, SL: {}, TP: {}",
+            if signal > 0.0 { "Long" } else { "Short" },
+            formatted_entry_price,
+            formatted_position_size,
+            stop_loss,
+            take_profit
+        );
+    }
+
+    /// Exit trade and update PnL
+    async fn exit_trade(&mut self, exit_price: f64) {
+        debug!("Exiting trade at price: {}", exit_price);
+        if let Some(trade) = &self.current_trade {
+            let offset_size = -trade.position_size;
+
+            // Calculate PnL
+            let price_diff = exit_price - trade.entry_price;
+            let pnl = if trade.position_size > 0.0 {
+                price_diff * trade.position_size
+            } else {
+                -price_diff * trade.position_size
+            };
+
+            // Add exit fees
+            let exit_fees = exit_price * trade.position_size.abs() * MAKER_FEE;
+            let total_fees = trade.fees_paid + exit_fees;
+
+            // Update capital
+            self.capital += pnl - total_fees;
+
+            let mut closed_trade = self.current_trade.take().unwrap();
+            closed_trade.pnl = pnl;
+            closed_trade.fees_paid = total_fees;
+
+            // Place exit order
+            if let Err(e) = self.place_order(offset_size, exit_price).await {
+                error!("Failed to place exit order: {}", e);
+                return;
+            }
+
+            self.closed_trades.push(closed_trade);
+
+            info!(
+                "Trade closed - PnL: ${:.2}, Fees: ${:.2}, Current Capital: ${:.2}",
+                pnl, total_fees, self.capital
+            );
+        }
     }
 
     /// Start the bot: subscribe to channels and process messages in a loop
@@ -155,7 +371,7 @@ impl OrderFlowTradingBot {
         while let Some(message) = receiver.recv().await {
             match message {
                 Message::AllMids(all_mids) => {
-                    if let Some(mid) = all_mids.data.mids.get(&self.asset) {
+                    if let Some(mid) = all_mids.data.mids.get(&self.config.bot.asset) {
                         match mid.parse::<f64>() {
                             Ok(px) => {
                                 self.latest_mid_price = get_price(px, 0.1);
@@ -217,15 +433,21 @@ impl OrderFlowTradingBot {
         sender: tokio::sync::mpsc::UnboundedSender<Message>,
     ) -> eyre::Result<()> {
         debug!("Subscribing to all streams");
-        // 1) Fills / user events
-        self.info_client
-            .subscribe(Subscription::UserEvents { user: self.user_address }, sender.clone())
-            .await
-            .map_err(|e| eyre::eyre!("Failed to subscribe to user events: {}", e))?;
+
+        if self.user_address.is_some() {
+            // 1) Fills / user events
+            self.info_client
+                .subscribe(
+                    Subscription::UserEvents { user: self.user_address.unwrap() },
+                    sender.clone(),
+                )
+                .await
+                .map_err(|e| eyre::eyre!("Failed to subscribe to user events: {}", e))?;
+        }
 
         // 2) OrderBook (L2)
         self.info_client
-            .subscribe(Subscription::L2Book { coin: self.asset.clone() }, sender.clone())
+            .subscribe(Subscription::L2Book { coin: self.config.bot.asset.clone() }, sender.clone())
             .await
             .map_err(|e| eyre::eyre!("Failed to subscribe to L2Book: {}", e))?;
 
@@ -238,7 +460,10 @@ impl OrderFlowTradingBot {
         // 4) 1H candles
         self.info_client
             .subscribe(
-                Subscription::Candle { coin: self.asset.clone(), interval: "1h".to_string() },
+                Subscription::Candle {
+                    coin: self.config.bot.asset.clone(),
+                    interval: "1h".to_string(),
+                },
                 sender.clone(),
             )
             .await
@@ -247,7 +472,10 @@ impl OrderFlowTradingBot {
         // 5) 5m candles
         self.info_client
             .subscribe(
-                Subscription::Candle { coin: self.asset.clone(), interval: "5m".to_string() },
+                Subscription::Candle {
+                    coin: self.config.bot.asset.clone(),
+                    interval: "5m".to_string(),
+                },
                 sender,
             )
             .await
@@ -273,10 +501,10 @@ impl OrderFlowTradingBot {
                 // Adjust current_position
                 if fill.side.eq("B") {
                     self.current_position += amount;
-                    info!("Fill: bought {} {}", amount, self.asset);
+                    info!("Fill: bought {} {}", amount, self.config.bot.asset);
                 } else {
                     self.current_position -= amount;
-                    info!("Fill: sold {} {}", amount, self.asset);
+                    info!("Fill: sold {} {}", amount, self.config.bot.asset);
                 }
             }
         }
@@ -344,7 +572,9 @@ impl OrderFlowTradingBot {
     async fn generate_trading_signal(&mut self) {
         debug!("Generating trading signal");
         // Wait until we have enough data
-        if self.hourly_candles.len() < 24 || self.five_min_candles.len() < 12 {
+        if self.hourly_candles.len() < self.config.vwap.hourly_periods ||
+            self.five_min_candles.len() < self.config.vwap.five_min_periods
+        {
             debug!(
                 "Insufficient data for trading signal generation 24h: {}, 5m: {}",
                 self.hourly_candles.len(),
@@ -376,76 +606,6 @@ impl OrderFlowTradingBot {
         }
     }
 
-    /// Enter a trade if risk/reward looks decent
-    async fn enter_trade(&mut self, signal: f64) {
-        debug!("Entering trade with signal: {}", signal);
-        // Ensure we have a valid mid price
-        if self.latest_mid_price <= 0.0 {
-            warn!("No valid mid price available to enter trade.");
-            return;
-        }
-
-        let entry_price = self.latest_mid_price;
-
-        // GPT generated
-        // Raw size can be positive (long) or negative (short).
-        let raw_size = self.order_size * signal;
-        // The maximum allowed magnitude.
-        let max_size = self.max_position_size * self.risk_factor;
-        // Limit the absolute value, then reapply the sign from `raw_size`.
-        let position_size = raw_size.abs().min(max_size) * raw_size.signum();
-
-        // Format logs with decimals
-        let formatted_entry_price = format!("{:.*}", self.decimals as usize, entry_price);
-        let formatted_position_size = format!("{:.*}", self.decimals as usize, position_size.abs());
-
-        // Calculate a naive SL/TP
-        let stop_loss = if signal > 0.0 {
-            entry_price * (1.0 - self.risk_factor)
-        } else {
-            entry_price * (1.0 + self.risk_factor)
-        };
-        let take_profit = if signal > 0.0 {
-            entry_price * (1.0 + self.risk_factor * 2.0)
-        } else {
-            entry_price * (1.0 - self.risk_factor * 2.0)
-        };
-
-        info!(
-            "Entering trade: {} at price: {}, position size: {}",
-            if signal > 0.0 { "Long" } else { "Short" },
-            formatted_entry_price,
-            formatted_position_size
-        );
-
-        // Check basic R:R with fees
-        let risk = (entry_price - stop_loss).abs() + entry_price * TAKER_FEE;
-        let reward = (take_profit - entry_price).abs() - take_profit * MAKER_FEE;
-
-        if reward > risk {
-            // Place the opening order
-            if let Err(e) = self.place_order(position_size, entry_price).await {
-                error!("Failed to place opening order: {}", e);
-                return;
-            }
-
-            // Store the trade
-            self.current_trade = Some(Trade { entry_price, position_size, stop_loss, take_profit });
-
-            // Print trade
-            info!(
-                "Trade placed: {} at price: {}, position size: {}, SL: {}, TP: {}",
-                if signal > 0.0 { "Long" } else { "Short" },
-                formatted_entry_price,
-                formatted_position_size,
-                stop_loss,
-                take_profit
-            );
-        } else {
-            info!("Trade not placed due to unfavorable risk-reward ratio.");
-        }
-    }
-
     /// Check if SL/TP conditions are met
     async fn check_stop_loss_take_profit(&mut self) {
         if let Some(trade) = &self.current_trade {
@@ -466,82 +626,9 @@ impl OrderFlowTradingBot {
         }
     }
 
-    /// Exit trade by placing an offsetting order
-    async fn exit_trade(&mut self, exit_price: f64) {
-        debug!("Exiting trade at price: {}", exit_price);
-        if let Some(trade) = &self.current_trade {
-            let offset_size = -trade.position_size;
-            if let Err(e) = self.place_order(offset_size, exit_price).await {
-                error!("Failed to place exit order: {}", e);
-                return;
-            }
-        }
-
-        self.closed_trades.push(self.current_trade.take().unwrap());
-        self.current_trade = None;
-    }
-
-    /// Helper: place an order using the ExchangeClient
-    async fn place_order(&self, size: f64, price: f64) -> eyre::Result<()> {
-        debug!("Placing order: size = {}, price = {}", size, price);
-        let is_buy = size > 0.0;
-        let order_request = ClientOrderRequest {
-            asset: self.asset.clone(),
-            is_buy,
-            reduce_only: false,
-            limit_px: price,
-            sz: size.abs(),
-            cloid: None,
-            order_type: ClientOrder::Limit(ClientLimit { tif: "Gtc".to_string() }),
-        };
-
-        debug!("Placing order: {:?}", order_request);
-
-        match self.exchange_client.order(order_request, None).await {
-            Ok(ExchangeResponseStatus::Ok(order_response)) => {
-                if let Some(order_data) = order_response.data {
-                    if !order_data.statuses.is_empty() {
-                        match &order_data.statuses[0] {
-                            ExchangeDataStatus::Filled(filled_order) => {
-                                info!(
-                                    "Order filled: {} {} {} at {}",
-                                    if is_buy { "Bought" } else { "Sold" },
-                                    size.abs(),
-                                    self.asset,
-                                    price
-                                );
-                            }
-                            ExchangeDataStatus::Resting(_) => {
-                                info!(
-                                    "Order resting: {} {} {} at {}",
-                                    if is_buy { "Buy" } else { "Sell" },
-                                    size.abs(),
-                                    self.asset,
-                                    price
-                                );
-                            }
-                            ExchangeDataStatus::Error(e) => {
-                                error!("Error placing order: {}", e);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            Ok(ExchangeResponseStatus::Err(e)) => {
-                error!("Error placing order: {}", e);
-            }
-            Err(e) => {
-                error!("Error placing order: {}", e);
-            }
-        }
-
-        Ok(())
-    }
-
     fn get_cache_paths(&self) -> (String, String) {
-        let tick_cache_path = format!(".cache/{}", self.asset);
-        let candle_cache_path = format!(".cache/{}_candles", self.asset);
+        let tick_cache_path = format!(".cache/{}", self.config.bot.asset);
+        let candle_cache_path = format!(".cache/{}_candles", self.config.bot.asset);
         (tick_cache_path, candle_cache_path)
     }
 }
@@ -557,28 +644,26 @@ async fn main() -> eyre::Result<()> {
 
     debug!("Starting main function");
 
-    let private_key = std::env::var("PRIVATE_KEY_LONG")
-        .map_err(|_| eyre::eyre!("Missing PRIVATE_KEY in .env"))?;
-    let wallet = LocalWallet::from_str(&private_key)
-        .map_err(|e| eyre::eyre!("Invalid PRIVATE_KEY format: {}", e))?;
-    let user_address = std::env::var("USER_ADDRESS_LONG")
-        .map_err(|_| eyre::eyre!("Missing USER_ADDRESS_LONG in .env"))?
-        .parse()
-        .map_err(|e| eyre::eyre!("Invalid USER_ADDRESS format: {}", e))?;
+    // Load wallet and address only if not in test mode
+    let config_str = fs::read_to_string("config.toml")?;
+    let config: Config = toml::from_str(&config_str)?;
 
-    // Build and start the bot
-    // Create a new instance of the OrderFlowTradingBot
-    let mut bot = OrderFlowTradingBot::new(
-        "ETH".to_string(), // asset
-        1.0,               // max_position_size
-        0.01,              // risk_factor
-        0.1,               // order_size
-        2,                 // decimals
-        wallet,            // wallet
-        user_address,      // user_address
-    )
-    .await?;
+    let (wallet, user_address) = if !config.bot.test_mode {
+        let private_key = std::env::var("PRIVATE_KEY_LONG")
+            .map_err(|_| eyre::eyre!("Missing PRIVATE_KEY in .env"))?;
+        let wallet = LocalWallet::from_str(&private_key)
+            .map_err(|e| eyre::eyre!("Invalid PRIVATE_KEY format: {}", e))?;
+        let user_address = std::env::var("USER_ADDRESS_LONG")
+            .map_err(|_| eyre::eyre!("Missing USER_ADDRESS_LONG in .env"))?
+            .parse()
+            .map_err(|e| eyre::eyre!("Invalid USER_ADDRESS format: {}", e))?;
+        (Some(wallet), Some(user_address))
+    } else {
+        (None, None)
+    };
 
+    // Create and start the bot
+    let mut bot = OrderFlowTradingBot::new("config.toml", wallet, user_address).await?;
     bot.start().await?;
 
     Ok(())
