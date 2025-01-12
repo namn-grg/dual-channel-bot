@@ -653,10 +653,10 @@ async fn main() -> eyre::Result<()> {
     // Initialize logging
     tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
 
-    // Load environment variables
-    dotenv()?;
+    // Load environment variables if .env exists
+    let _ = dotenv(); // Ignore error if .env not found
 
-    debug!("Starting main function");
+    info!("Starting main function");
 
     // Load wallet and address only if not in test mode
     let config_str = fs::read_to_string("config.toml")?;
