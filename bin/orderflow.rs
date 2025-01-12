@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, fs, str::FromStr};
 
+use chrono::Utc;
 use dotenvy::dotenv;
 use ethers::{signers::LocalWallet, types::H160};
 use hyperliquid_rust_sdk::{
@@ -7,11 +8,15 @@ use hyperliquid_rust_sdk::{
     ExchangeDataStatus, ExchangeResponseStatus, InfoClient, Message, Subscription, UserData,
 };
 use serde::Deserialize;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::{sync::mpsc::unbounded_channel, time::interval};
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 
-use dual_channel_bot::{caching::store_candle_to_cache, get_price, store_tick_to_cache};
+use dual_channel_bot::{
+    caching::store_candle_to_cache,
+    get_price, store_tick_to_cache,
+    utils::{print_statistics, Direction, Trade},
+};
 
 const MAKER_FEE: f64 = 0.0001; // 0.01%
 const TAKER_FEE: f64 = 0.00034; // 0.034%
@@ -77,17 +82,6 @@ impl VWAP {
             0.0
         }
     }
-}
-
-#[derive(Debug)]
-/// A struct to keep track of a current open trade
-struct Trade {
-    entry_price: f64,
-    position_size: f64,
-    stop_loss: f64,
-    take_profit: f64,
-    pnl: f64,
-    fees_paid: f64,
 }
 
 /// Main bot struct
@@ -253,6 +247,7 @@ impl OrderFlowTradingBot {
 
         let entry_price = self.latest_mid_price;
         let position_size = self.calculate_position_size(entry_price) * signal.signum();
+        let direction = if signal > 0.0 { Direction::Long } else { Direction::Short };
 
         // Calculate stop loss and take profit based on risk config
         let stop_loss = if signal > 0.0 {
@@ -288,12 +283,13 @@ impl OrderFlowTradingBot {
 
         // Store the trade
         self.current_trade = Some(Trade {
+            direction,
             entry_price,
-            position_size,
-            stop_loss,
-            take_profit,
-            pnl: 0.0,
-            fees_paid: entry_price * position_size.abs() * TAKER_FEE,
+            entry_time: Utc::now().timestamp(),
+            size: position_size,
+            tp_price: take_profit,
+            sl_price: stop_loss,
+            close_price: None,
         });
 
         info!(
@@ -309,27 +305,27 @@ impl OrderFlowTradingBot {
     /// Exit trade and update PnL
     async fn exit_trade(&mut self, exit_price: f64) {
         debug!("Exiting trade at price: {}", exit_price);
-        if let Some(trade) = &self.current_trade {
-            let offset_size = -trade.position_size;
+        if let Some(mut trade) = self.current_trade.take() {
+            let offset_size = -trade.size;
 
             // Calculate PnL
             let price_diff = exit_price - trade.entry_price;
-            let pnl = if trade.position_size > 0.0 {
-                price_diff * trade.position_size
+            let pnl = if trade.direction == Direction::Long {
+                price_diff * trade.size
             } else {
-                -price_diff * trade.position_size
+                -price_diff * trade.size
             };
 
-            // Add exit fees
-            let exit_fees = exit_price * trade.position_size.abs() * MAKER_FEE;
-            let total_fees = trade.fees_paid + exit_fees;
+            // Calculate fees
+            let entry_fees = trade.entry_price * trade.size.abs() * TAKER_FEE;
+            let exit_fees = exit_price * trade.size.abs() * MAKER_FEE;
+            let total_fees = entry_fees + exit_fees;
 
             // Update capital
             self.capital += pnl - total_fees;
 
-            let mut closed_trade = self.current_trade.take().unwrap();
-            closed_trade.pnl = pnl;
-            closed_trade.fees_paid = total_fees;
+            // Update trade with close price
+            trade.close_price = Some(exit_price);
 
             // Place exit order
             if let Err(e) = self.place_order(offset_size, exit_price).await {
@@ -337,7 +333,7 @@ impl OrderFlowTradingBot {
                 return;
             }
 
-            self.closed_trades.push(closed_trade);
+            self.closed_trades.push(trade);
 
             info!(
                 "Trade closed - PnL: ${:.2}, Fees: ${:.2}, Current Capital: ${:.2}",
@@ -355,76 +351,77 @@ impl OrderFlowTradingBot {
         // Setup subscriptions
         self.subscribe_all(sender.clone()).await?;
 
-        // let mut stats_interval = interval(std::time::Duration::from_secs(STATS_INTERVAL_SECS));
-        // let current_position = self.current_position;
-        // let closed_trades_len = self.closed_trades.len();
-        // tokio::spawn(async move {
-        //     loop {
-        //         stats_interval.tick().await;
-        //         info!("Current position: {}, closed trades: {}", current_position,
-        // closed_trades_len);     }
-        // });
-
+        let mut stats_interval = interval(std::time::Duration::from_secs(STATS_INTERVAL_SECS));
         let (tick_cache_path, candle_cache_path) = self.get_cache_paths();
 
         // Main message loop
-        while let Some(message) = receiver.recv().await {
-            match message {
-                Message::AllMids(all_mids) => {
-                    if let Some(mid) = all_mids.data.mids.get(&self.config.bot.asset) {
-                        match mid.parse::<f64>() {
-                            Ok(px) => {
-                                self.latest_mid_price = get_price(px, 0.1);
-                                self.check_stop_loss_take_profit().await;
+        loop {
+            tokio::select! {
+                Some(message) = receiver.recv() => {
+                    match message {
+                        Message::AllMids(all_mids) => {
+                            if let Some(mid) = all_mids.data.mids.get(&self.config.bot.asset) {
+                                match mid.parse::<f64>() {
+                                    Ok(px) => {
+                                        self.latest_mid_price = get_price(px, 0.1);
+                                        self.check_stop_loss_take_profit().await;
 
-                                if let Err(e) = store_tick_to_cache(&tick_cache_path, px) {
-                                    error!("Failed to store tick: {}", e);
+                                        if let Err(e) = store_tick_to_cache(&tick_cache_path, px) {
+                                            error!("Failed to store tick: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to parse mid price: {}", e);
+                                    }
                                 }
-                                debug!("Received mid price: {}", px);
                             }
-                            Err(e) => {
-                                warn!("Failed to parse mid price: {}", e);
+                        }
+                        Message::User(user_events) => {
+                            self.handle_user_event(user_events.data).await;
+                        }
+                        Message::L2Book(order_book) => {
+                            let update = OrderBookUpdate {
+                                bids: order_book.data.levels[0]
+                                    .iter()
+                                    .filter_map(|level| {
+                                        let px = level.px.parse().ok()?;
+                                        let sz = level.sz.parse().ok()?;
+                                        Some((px, sz))
+                                    })
+                                    .collect(),
+                                asks: order_book.data.levels[1]
+                                    .iter()
+                                    .filter_map(|level| {
+                                        let px = level.px.parse().ok()?;
+                                        let sz = level.sz.parse().ok()?;
+                                        Some((px, sz))
+                                    })
+                                    .collect(),
+                            };
+                            self.process_order_book_update(update).await;
+                        }
+                        Message::Candle(candle) => {
+                            self.process_candle(candle.data.clone()).await;
+
+                            if let Err(e) = store_candle_to_cache(&candle_cache_path, &candle.data) {
+                                error!("Failed to store candle: {}", e);
                             }
+                        }
+                        _ => {
+                            // Unhandled message type - you might want to log or ignore
                         }
                     }
                 }
-                Message::User(user_events) => {
-                    self.handle_user_event(user_events.data).await;
-                }
-                Message::L2Book(order_book) => {
-                    let update = OrderBookUpdate {
-                        bids: order_book.data.levels[0]
-                            .iter()
-                            .filter_map(|level| {
-                                let px = level.px.parse().ok()?;
-                                let sz = level.sz.parse().ok()?;
-                                Some((px, sz))
-                            })
-                            .collect(),
-                        asks: order_book.data.levels[1]
-                            .iter()
-                            .filter_map(|level| {
-                                let px = level.px.parse().ok()?;
-                                let sz = level.sz.parse().ok()?;
-                                Some((px, sz))
-                            })
-                            .collect(),
-                    };
-                    self.process_order_book_update(update).await;
-                }
-                Message::Candle(candle) => {
-                    self.process_candle(candle.data.clone()).await;
-
-                    if let Err(e) = store_candle_to_cache(&candle_cache_path, &candle.data) {
-                        error!("Failed to store candle: {}", e);
-                    }
-                }
-                _ => {
-                    // Unhandled message type - you might want to log or ignore
+                _ = stats_interval.tick() => {
+                    print_statistics(&self.closed_trades);
+                    info!(
+                        "Capital: ${:.2}, Current Position: {:?}",
+                        self.capital,
+                        self.current_trade.unwrap_or(Trade::default())
+                    );
                 }
             }
         }
-        Ok(())
     }
 
     /// Subscribe to all needed streams.
@@ -570,7 +567,6 @@ impl OrderFlowTradingBot {
 
     /// Generate trading signals based on VWAPs and current position
     async fn generate_trading_signal(&mut self) {
-        debug!("Generating trading signal");
         // Wait until we have enough data
         if self.hourly_candles.len() < self.config.vwap.hourly_periods ||
             self.five_min_candles.len() < self.config.vwap.five_min_periods
@@ -610,15 +606,16 @@ impl OrderFlowTradingBot {
     async fn check_stop_loss_take_profit(&mut self) {
         if let Some(trade) = &self.current_trade {
             // Stop Loss
-            if (trade.position_size > 0.0 && self.latest_mid_price <= trade.stop_loss) ||
-                (trade.position_size < 0.0 && self.latest_mid_price >= trade.stop_loss)
+            if (trade.direction == Direction::Long && self.latest_mid_price <= trade.sl_price) ||
+                (trade.direction == Direction::Short && self.latest_mid_price >= trade.sl_price)
             {
                 debug!("Stop Loss hit at price: {}", self.latest_mid_price);
                 self.exit_trade(self.latest_mid_price).await;
             }
             // Take Profit
-            else if (trade.position_size > 0.0 && self.latest_mid_price >= trade.take_profit) ||
-                (trade.position_size < 0.0 && self.latest_mid_price <= trade.take_profit)
+            else if (trade.direction == Direction::Long &&
+                self.latest_mid_price >= trade.tp_price) ||
+                (trade.direction == Direction::Short && self.latest_mid_price <= trade.tp_price)
             {
                 debug!("Take Profit hit at price: {}", self.latest_mid_price);
                 self.exit_trade(self.latest_mid_price).await;

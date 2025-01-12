@@ -33,7 +33,7 @@ pub fn get_size(amount: f64, price: f64) -> f64 {
 /// Utility function to print statistics for closed trades
 pub fn print_statistics(closed_trades: &Vec<Trade>) {
     if closed_trades.is_empty() {
-        println!("No trades to summarize.");
+        debug!("No trades to summarize.");
         return;
     }
 
@@ -119,6 +119,21 @@ pub struct Trade {
     pub tp_price: f64,
     pub sl_price: f64,
     pub close_price: Option<f64>,
+}
+
+impl Trade {
+    /// Default constructor for a new trade
+    pub fn default() -> Self {
+        Trade {
+            direction: Direction::Long,
+            entry_price: 0.0,
+            entry_time: 0,
+            size: 0.0,
+            tp_price: 0.0,
+            sl_price: 0.0,
+            close_price: None,
+        }
+    }
 }
 
 pub fn check_should_close(
