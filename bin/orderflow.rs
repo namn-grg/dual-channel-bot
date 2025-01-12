@@ -98,6 +98,8 @@ pub struct OrderFlowTradingBot {
     // Candle buffers
     hourly_candles: VecDeque<CandleData>,
     five_min_candles: VecDeque<CandleData>,
+    last_hourly_candle_ts: i64, // Timestamp of last processed hourly candle
+    last_five_min_candle_ts: i64, // Timestamp of last processed 5min candle
 
     // VWAP trackers
     hourly_vwap: VWAP,
@@ -153,6 +155,9 @@ impl OrderFlowTradingBot {
 
             hourly_candles: VecDeque::with_capacity(24),
             five_min_candles: VecDeque::with_capacity(12),
+            last_hourly_candle_ts: 0,
+            last_five_min_candle_ts: 0,
+
             hourly_vwap: VWAP::new(),
             five_min_vwap: VWAP::new(),
 
@@ -530,7 +535,17 @@ impl OrderFlowTradingBot {
 
     /// Process a candle message
     async fn process_candle(&mut self, candle: CandleData) {
-        debug!("Processing candle data: {:?}", candle);
+        let candle_ts = candle.time_close as i64;
+
+        // Skip if we've already processed this candle
+        if (candle.interval == "1h" && candle_ts <= self.last_hourly_candle_ts) ||
+            (candle.interval == "5m" && candle_ts <= self.last_five_min_candle_ts)
+        {
+            trace!("Skipping duplicate candle update for interval {}", candle.interval);
+            return;
+        }
+
+        debug!("Processing new candle data: {:?}", candle);
         let price: f64 = match candle.close.parse() {
             Ok(p) => p,
             Err(e) => {
@@ -554,12 +569,14 @@ impl OrderFlowTradingBot {
                 self.hourly_candles.pop_front();
             }
             self.hourly_vwap.update(price, volume);
+            self.last_hourly_candle_ts = candle_ts;
         } else if candle.interval == "5m" {
             self.five_min_candles.push_back(candle);
             if self.five_min_candles.len() > 12 {
                 self.five_min_candles.pop_front();
             }
             self.five_min_vwap.update(price, volume);
+            self.last_five_min_candle_ts = candle_ts;
         }
 
         self.generate_trading_signal().await;
