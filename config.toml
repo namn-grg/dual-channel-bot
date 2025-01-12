@@ -19,5 +19,5 @@ take_profit = 0.02  # 2%
 
 [vwap]
 # Number of periods to keep for VWAP calculation
-hourly_periods = 24
+hourly_periods = 6
 five_min_periods = 12 

@@ -562,25 +562,19 @@ impl OrderFlowTradingBot {
             }
         };
 
-        let volume: f64 = match candle.volume.parse() {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Failed to parse candle volume: {}", e);
-                return;
-            }
-        };
+        let volume: f64 = candle.volume.parse().unwrap();
 
         // Update appropriate candle buffer and VWAP
         if candle.interval == "1h" {
             self.hourly_candles.push_back(candle);
-            if self.hourly_candles.len() > 24 {
+            if self.hourly_candles.len() > self.config.vwap.hourly_periods * 2 {
                 self.hourly_candles.pop_front();
             }
             self.hourly_vwap.update(price, volume);
             self.last_hourly_candle_ts = candle_ts;
         } else if candle.interval == "5m" {
             self.five_min_candles.push_back(candle);
-            if self.five_min_candles.len() > 12 {
+            if self.five_min_candles.len() > self.config.vwap.five_min_periods * 2 {
                 self.five_min_candles.pop_front();
             }
             self.five_min_vwap.update(price, volume);
