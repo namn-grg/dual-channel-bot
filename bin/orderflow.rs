@@ -359,6 +359,11 @@ impl OrderFlowTradingBot {
         let mut stats_interval = interval(std::time::Duration::from_secs(STATS_INTERVAL_SECS));
         let (tick_cache_path, candle_cache_path) = self.get_cache_paths();
 
+        // Create cache directory if it doesn't exist
+        if let Some(cache_dir) = std::path::Path::new(&tick_cache_path).parent() {
+            fs::create_dir_all(cache_dir)?;
+        }
+
         // Main message loop
         loop {
             tokio::select! {
@@ -406,10 +411,21 @@ impl OrderFlowTradingBot {
                             self.process_order_book_update(update).await;
                         }
                         Message::Candle(candle) => {
-                            self.process_candle(candle.data.clone()).await;
+                            let candle_data = candle.data.clone();
 
-                            if let Err(e) = store_candle_to_cache(&candle_cache_path, &candle.data) {
-                                error!("Failed to store candle: {}", e);
+                            // Only process if it's a new candle
+                            let candle_ts = candle_data.time_close as i64;
+                            let should_process = match candle_data.interval.as_str() {
+                                "1h" => candle_ts > self.last_hourly_candle_ts,
+                                "5m" => candle_ts > self.last_five_min_candle_ts,
+                                _ => false,
+                            };
+
+                            if should_process {
+                                self.process_candle(candle_data.clone()).await;
+                                if let Err(e) = store_candle_to_cache(&candle_cache_path, &candle_data) {
+                                    error!("Failed to store candle: {}", e);
+                                }
                             }
                         }
                         _ => {
@@ -536,14 +552,6 @@ impl OrderFlowTradingBot {
     /// Process a candle message
     async fn process_candle(&mut self, candle: CandleData) {
         let candle_ts = candle.time_close as i64;
-
-        // Skip if we've already processed this candle
-        if (candle.interval == "1h" && candle_ts <= self.last_hourly_candle_ts) ||
-            (candle.interval == "5m" && candle_ts <= self.last_five_min_candle_ts)
-        {
-            trace!("Skipping duplicate candle update for interval {}", candle.interval);
-            return;
-        }
 
         debug!("Processing new candle data: {:?}", candle);
         let price: f64 = match candle.close.parse() {
