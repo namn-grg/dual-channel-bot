@@ -238,7 +238,7 @@ async fn process_messages(
                     Ok(should_reconnect) => {
                         if should_reconnect {
                             sub_manager.unsubscribe_all().await?;
-                            sleep(Duration::from_secs(1)).await;
+                            sleep(Duration::from_secs(3)).await;
                             sub_manager.subscribe_all().await?;
                         }
                     }
