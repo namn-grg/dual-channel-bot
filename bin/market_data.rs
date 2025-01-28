@@ -16,7 +16,7 @@ use tokio::{
     time::sleep,
 };
 use tracing::{debug, error, info, instrument, warn};
-use tracing_subscriber;
+use tracing_subscriber::{self, EnvFilter};
 
 #[derive(Error, Debug)]
 pub enum MarketDataError {
@@ -118,7 +118,6 @@ struct MessageHandler {
 }
 
 impl MessageHandler {
-    #[instrument(skip(self))]
     fn handle_message(&mut self, message: Message) -> Result<bool, MarketDataError> {
         self.message_count += 1;
         let should_reconnect = self.message_count >= self.max_messages;
@@ -169,7 +168,7 @@ impl MessageHandler {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = tracing_subscriber::fmt().with_env_filter("info,market_data=debug").try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).try_init();
 
     let args = Args::parse();
     let assets: Vec<String> = args.assets.split(',').map(|s| s.trim().to_string()).collect();
