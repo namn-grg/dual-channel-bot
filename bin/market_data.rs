@@ -1,11 +1,11 @@
-use clap::Parser;
-use dual_channel_bot::caching::{store_candle_to_cache, store_tick_to_cache};
-use eyre::{eyre, Result};
-use hyperliquid_rust_sdk::{BaseUrl, InfoClient, Message, Subscription};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+
+use clap::Parser;
+use eyre::{eyre, Result};
+use hyperliquid_rust_sdk::{BaseUrl, InfoClient, Message, Subscription};
 use thiserror::Error;
 use tokio::{
     select,
@@ -18,6 +18,8 @@ use tokio::{
 use tracing::{debug, error, info, instrument, warn};
 use tracing_subscriber::{self, EnvFilter};
 
+use dual_channel_bot::caching::{store_candle_to_cache, store_tick_to_cache};
+
 #[derive(Error, Debug)]
 pub enum MarketDataError {
     #[error("Subscription error: {0}")]
@@ -27,12 +29,6 @@ pub enum MarketDataError {
     #[error("Connection error: {0}")]
     ConnectionError(String),
 }
-
-// impl From<MarketDataError> for eyre::Report {
-//     fn from(err: MarketDataError) -> Self {
-//         eyre!("{}", err)
-//     }
-// }
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -168,7 +164,7 @@ impl MessageHandler {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).with_thread_ids(true).try_init();
 
     let args = Args::parse();
     let assets: Vec<String> = args.assets.split(',').map(|s| s.trim().to_string()).collect();
