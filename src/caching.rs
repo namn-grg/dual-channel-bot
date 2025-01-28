@@ -52,6 +52,11 @@ pub fn load_ticks_from_cache(path: &str) -> eyre::Result<Vec<PriceTick>> {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SerializableCandleData {
+    pub time_open: u64,
+    pub time_close: u64,
+    pub open: String,
+    pub high: String,
+    pub low: String,
     pub close: String,
     pub volume: String,
     pub interval: String,
@@ -60,6 +65,11 @@ pub struct SerializableCandleData {
 impl From<&CandleData> for SerializableCandleData {
     fn from(candle: &CandleData) -> Self {
         Self {
+            time_open: candle.time_open,
+            time_close: candle.time_close,
+            open: candle.open.clone(),
+            high: candle.high.clone(),
+            low: candle.low.clone(),
             close: candle.close.clone(),
             volume: candle.volume.clone(),
             interval: candle.interval.clone(),

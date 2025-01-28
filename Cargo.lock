@@ -737,6 +737,7 @@ dependencies = [
  "hyperliquid_rust_sdk",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "toml",
  "tracing",
