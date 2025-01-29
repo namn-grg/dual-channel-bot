@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 use chrono::Utc;
-use hyperliquid_rust_sdk::CandleData;
+use hyperliquid_rust_sdk::{AssetCtx, CandleData};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -115,4 +115,15 @@ pub fn load_candles_from_cache(path: &str) -> eyre::Result<Vec<CandleDataRecord>
         records.push(rec);
     }
     Ok(records)
+}
+
+pub fn store_asset_to_cache(path: &str, data: AssetCtx) -> eyre::Result<()> {
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+
+    serde_json::to_writer(&mut writer, &data)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+
+    Ok(())
 }
