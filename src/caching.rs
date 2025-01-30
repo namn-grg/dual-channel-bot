@@ -117,11 +117,19 @@ pub fn load_candles_from_cache(path: &str) -> eyre::Result<Vec<CandleDataRecord>
     Ok(records)
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AssetCtxRecord {
+    pub timestamp: i64,
+    pub asset: AssetCtx,
+}
+
+/// Store an asset information to the cache
 pub fn store_asset_to_cache(path: &str, data: AssetCtx) -> eyre::Result<()> {
+    let record = AssetCtxRecord { timestamp: chrono::Utc::now().timestamp(), asset: data };
     let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     let mut writer = std::io::BufWriter::new(file);
 
-    serde_json::to_writer(&mut writer, &data)?;
+    serde_json::to_writer(&mut writer, &record)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
 
